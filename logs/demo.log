@@ -1,0 +1,8 @@
+2025-10-07 18:41:21,887 | DEBUG    | r0 | lazyclo: Debug message (sanity check).
+2025-10-07 18:41:21,889 | INFO     | r0 | lazyclo: Info message: logging is initialized.
+2025-10-07 18:41:21,889 | WARNING  | r0 | lazyclo: Warning message: example.
+2025-10-07 18:41:21,890 | ERROR    | r0 | lazyclo: This is an example exception with traceback.
+Traceback (most recent call last):
+  File "/Users/agus/repositories/lazy_transformer/utils/logging_utils.py", line 226, in <module>
+    1 / 0
+ZeroDivisionError: division by zero

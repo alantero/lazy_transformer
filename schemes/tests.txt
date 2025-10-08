@@ -1,0 +1,86 @@
+Te reorganizo el plan de fases con **tests/checks específicos por fase**, para que avances con confianza. Usa un framework como pytest para automatizar (instálalo en requirements.txt). Para datos sintéticos, genera batches dummy: e.g., torch.randn(B, T, D) o secuencias periódicas/ruido para probar estabilidad/espectro.
+
+### Fase 0 — Andamiaje y utilidades
+- **Tests**: 
+  - laplacian.py: Construye L̃ para T=512; check que sea simétrica, espectro en [-1,1] (eigenvals con torch.linalg.eigvals).
+  - windows.py: sliding_windows en tensor dummy (B=2, seq_len=2048, W=512, O=64); verifica shapes [B, num_windows, W, D], máscaras collar solapadas correctamente (sum(mask) == O por ventana adyacente).
+- **Checks**: Forward dummy: no errores de dim; perfila flops con torch.utils.benchmark.
+- **Herramienta**: pytest para assert shapes/espectro.
+
+### Fase 1 — Normalización base y gauge
+- **Tests**:
+  - normalize.py: traceless en ruido blanco; post-aplicación: mean≈0 por grupo, var≈1 (torch.mean(y.view(B,T,G,g), dim=-1).abs().max() < 1e-4).
+  - gauge.py: capacity_signal dummy (e.g., torch.rand(B,T,1)); post-gauge: s en [smin,smax], no exploding (norm(h*s) ≈ norm(h)).
+- **Checks**: Gradientes: backward en loss dummy (e.g., (y**2).mean()); no NaN/Inf.
+- **Forward parcial**: Batch dummy → traceless → gauge; visualiza con matplotlib (e.g., plot norms pre/post).
+
+### Fase 2 — Banco mínimo + Port-Hamiltonian + Integrador básico
+- **Tests**:
+  - operators/cheb.py: Forward en senos (entrada periódica); salida debe preservar frecuencias bajas (FFT check con torch.fft).
+  - portham.py: Check R succeq0 (eigenvals >=0), J skew (J + J.T ≈0); ΔBKM proxy (e.g., norm(h_{t+1}-h_t) decreciente).
+  - integrator.py: Integra 5 pasos en señal dummy; check no exploding (norm(h_final) < 2*norm(h_init)); symplectic conserva energía en J (para ondas puras, norm constante ±ε).
+- **Checks**: Estabilidad: corre 100 pasos en ruido; no diverge. Perfila flops por paso.
+- **Forward parcial**: Dummy → traceless → Cheb → portham → integrate (sin parada); plot h(t) para ondas.
+
+### Fase 3 — Head y loop mínimo de entrenamiento
+- **Tests**:
+  - tokenize.py: Embedding factorizado en vocab dummy (V=100); check logits tying (E_V.T @ (h @ E_d.T) shape correcta).
+  - loop.py minimal: Forward completo en batch sintético (e.g., secuencias repetidas); CE baja en overfit dummy (e.g., input=output shifted).
+- **Checks**: End-to-end dim: batch → ventanas → normalize → op → integrate → head → loss; no mismatch.
+- **Herramienta**: torch.autograd.anomaly_detect para gradientes anómalos.
+
+### Fase 4 — Gating escaso y resto del banco
+- **Tests**:
+  - operators/adv/osc/lowrank.py: Cada uno en input dummy; adv preserva causalidad (mask triangular), osc genera períodos, lowrank baja dims.
+  - gate.py: Entmax/L0 en features dummy; activa 1-2 ops (sum(w>0.1) ≤2); corr loss baja solapes (corr_matrix(outputs) <0.1).
+- **Checks**: Banco forward: suma ponderada; sparsidad reduce flops (perfila con/without gate).
+- **Forward parcial**: Collar dummy → gate → banco → portham; visualiza selección por tipo input (e.g., senos → osc).
+
+### Fase 5 — Stitching sólo-borde + métricas + parada lazy
+- **Tests**:
+  - stitching.py: Procrustes en reps dummy alineadas; SKL≈0 en logits idénticos, >0 en random. ΔBKM decreciente.
+  - hooks.py: should_advance_step en ΔBKM dummy; para early (e.g., 2-3 pasos en señal estable).
+  - loop: Grads border-only; bulk no_grad() → no grad en bulk params (check param.grad is None).
+- **Checks**: Drift detector: simula drift bulk; refresh activa grads full temporalmente.
+- **Forward parcial**: Dos ventanas solapadas → stitching; check acuerdo post-align.
+
+### Fase 6 — Ledger = rate (virtual)
+- **Tests**:
+  - ledger.py: RateModel en collar dummy; log-prob negativa baja (entropía controlada); olvido si rate alta.
+  - rate_loss.py: Loss escala con bits; coarse/fine implícito (rate sube si acuerdo gana).
+- **Checks**: Virtual vs real: compara bits estimados vs codificación (opcional rANS); no overhead en training.
+- **Forward parcial**: Collar → ledger → rate; visualiza bits vs demanda.
+
+### Fase 7 — Krylov-lazy
+- **Tests**:
+  - krylov.py: Construye basis en residuo dummy; QR ortho (dot products ≈0); corrige residuo (norm post < pre).
+- **Checks**: Activación: solo si ΔBKM alta; no estado persistente (reinicio).
+- **Forward parcial**: Collar con residuo → Krylov → corrección; check ΔBKM baja.
+
+### Fase 8 — Duales por SDA
+- **Tests**:
+  - sda.py: Update en subgrad dummy; λ>0, no serrucho (plot λ over iters).
+- **Checks**: Integración: λ sube si ΔBKM>ε (más capacidad); baja si coste alto.
+- **Forward parcial**: Loop con duales dummy; check auto-ajuste.
+
+### Fase 8 — QAT guiado por capacidad
+- **Tests**:
+  - quant.py: Allocator asigna int4 en grupos bajos-demanda; QAT forward/backward no NaN.
+- **Checks**: Pre/post QAT perf en dummy; <2% drop; memoria baja (torch.quantize_per_tensor check).
+- **Forward parcial**: Normalize → quant → op; compara float vs quant.
+
+### Fase 9 — Distilación y especulativa
+- **Tests**:
+  - speculative.py: Propuesta 2-3 desde ledger; rechazo bajo en acuerdo dummy.
+- **Checks**: Speed-up: tokens/s +x1.2; distilación border-only baja loss collar.
+- **Forward parcial**: Ledger → speculate → accept/reject.
+
+### Fase 10 — Inferencia streaming
+- **Tests**:
+  - streamer.py: Secuencia larga → ventanas → stitching → output; memoria constante ~w+bits.
+- **Checks**: Escala a 10k+ tokens; no degradación acuerdo.
+
+### Fase 11 — Tests globales y ablaciones
+- **Tests**: End-to-end overfit small dataset (e.g., tiny-shakespeare); ablaciones per checklist (e.g., banco 3 vs 4: perf/flops).
+- **Herramientas**: pytest para units; wandb/tensorboard para métricas; torch.profiler para flops/mem.
+

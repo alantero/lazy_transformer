@@ -1,0 +1,315 @@
+¡Hecho! Te dejo un plan “de cero a productizable” en tres partes: (1) árbol de directorios, (2) qué va en cada fichero (con nombres de clases/funciones), y (3) el orden recomendado de implementación con hitos y checks. Todo está alineado con v3 (traceless+gauge, banco de operadores, port-Hamiltonian, parada lazy, stitching sólo-borde, ledger por rate, Krylov-lazy, QAT, duales SDA).  
+
+1) Árbol de directorios
+
+lazyclo/
+  __init__.py
+  config.py
+  utils/
+    laplacian.py
+    windows.py
+    capacity.py
+    procrustes.py
+    ema.py
+    logging.py
+    seed.py
+    profile.py
+  data/
+    tokenize.py
+    dataloaders.py
+  modules/
+    normalize.py        # traceless + norm por grupos
+    gauge.py            # WeylGauge (capacidad)
+    operators/
+      __init__.py
+      cheb.py           # difusivo (Chebyshev sobre L̃)
+      advective.py      # transportivo (conv1d ligera)
+      oscillatory.py    # oscilatorio (senos/cosenos)
+      lowrank.py        # low-rank corto (Nyström)
+    gate.py             # SparseGate (entmax/Hard-Concrete)
+    portham.py          # paso Port-Hamiltonian
+    integrator.py       # ETD + symplectic (leapfrog)
+    stitching.py        # low-D, Procrustes, collar masks, ΔBKM/SKL
+    krylov.py           # corrección local reiniciada
+    ledger.py           # modelo de entropía (rate virtual)
+    quant.py            # QAT y asignación de bits por capacidad
+    output_head.py      # proyección d→k + tying con E_V^T
+  losses/
+    task_loss.py        # CE causal/seq2seq
+    stitching_loss.py   # SKL/logits + MSE/Procrustes en low-D
+    regularizers.py     # correlación banco, sparsidad gate, MDL(p/R)
+    rate_loss.py        # coste en bits del ledger
+  optim/
+    sda.py              # Stochastic Dual Averaging (λ, α en log-space)
+    schedulers.py
+  train/
+    loop.py             # bucle end-to-end (grads sólo-borde)
+    hooks.py            # parada lazy, drift detector bulk
+    metrics.py          # ΔBKM (collar), c_step, entropía, etc
+    checkpoints.py
+  infer/
+    streamer.py         # inferencia por ventanas con solape
+    speculative.py      # especulativa desde el ledger
+  tests/
+    test_units.py
+    test_ops.py
+    test_stitching.py
+    test_train_step.py
+    test_infer_stream.py
+scripts/
+  train_lm.py
+  eval_lm.py
+configs/
+  base.yaml
+  small_gpt2_equiv.yaml
+requirements.txt
+README.md
+
+2) Qué va en cada fichero (resumen operativo)
+	•	config.py: dataclass/omegaconf para d, k, groups, W, O, p, R, pasos, etc; flags de ablación. (Valores guía en v3.)  
+	•	utils/laplacian.py: build_norm_laplacian(T, mode="cheb"| "fft") — L̃ normalizado y utilidades Chebyshev. (Sección operadores espectrales.)  
+	•	utils/windows.py: sliding_windows(x, W, O) y collar_mask(W, O); re-escalado local a [0,1] por ventana. (Ventanas con solape/collar.)  
+	•	utils/capacity.py: capacity_signal(logits_collar, ledger_stats) → entropía/ocupación; filtro EMA. (Gauge por capacidad + ledger.)  
+	•	utils/procrustes.py: orthobase_fit(x) y procrustes(a,b) en low-D. (Stitching en subespacio.)  
+	•	utils/ema.py: EMA genérica.
+	•	utils/logging.py, seed.py, profile.py: trazas, semillas, timers.
+	•	data/tokenize.py: vocab V, embedding factorized (E_V: V×k, E_d: k×d), tying. (1.1 del doc.)  
+	•	data/dataloaders.py: collate → ventanas con collar, máscaras de pérdida “sólo-borde”.
+	•	modules/normalize.py: traceless_groupwise(x, groups) y GroupwiseNorm. (Vacío→traza.)  
+	•	modules/gauge.py: WeylGauge(d) depthwise conv sobre señal de capacidad; clamps smin/smax. (Gauge Weyl.)  
+	•	modules/operators/cheb.py: ChebOp(d, groups, deg) (usa L̃).
+	•	…/advective.py: AdvectiveOp(d, kernel) (conv1d depthwise).
+	•	…/oscillatory.py: OscOp(d, modes) (base seno/cos + mix).
+	•	…/lowrank.py: LowRankOp(d, rank) (Nyström/low-rank).
+(Banco mínimo compartido y ortogonalidad + anticorrelación.)  
+	•	modules/gate.py: SparseGate(d_in, n_ops) con entmax o Hard-Concrete L0; toma features del collar. (Gating escaso.)  
+	•	modules/portham.py: PortHamiltonianStep(d) que combina salidas del banco en (J−R)G h con R≽0 y J=−J^T. (Operador físico estable.)  
+	•	modules/integrator.py: ETD_step(...) para disipativo y leapfrog_step(...) para ondulatorio; integrate_until_stop(...) con criterio ΔBKM > λ·c_step. (Integración + parada lazy.)  
+	•	modules/stitching.py:
+	•	LowDProjector(d, d_low) (base ortonormal compartida con re-ortho perezoso),
+	•	compute_overlap_metrics(rep_a, rep_b, logits_a, logits_b, mask) → ΔBKM/SKL,
+	•	align_procrustes(...) y generación de señales al ledger. (Stitching sólo-borde.)  
+	•	modules/krylov.py: krylov_lazy_correction(apply_A, r0, steps=2|3) reiniciado (no acumular rangos). (Corrección local mínima.)  
+	•	modules/ledger.py:
+	•	RateModel(d_low|d) (modelo de entropía shallow),
+	•	ledger_virtual_bits(...) y políticas de olvido/activación coarse/fine. (Ledger = rate virtual.)  
+	•	modules/quant.py:
+	•	CapacityAwareAllocator(groups) asigna int4/int8 por grupo/ventana,
+	•	hooks de QAT para coeficientes espectrales vs mezclas/ledger. (QAT guiado por capacidad.)  
+	•	modules/output_head.py: LMHeadTie(k, E_V) y proyección d→k. (Tying de salida.)  
+	•	losses/task_loss.py: CE causal/seq2seq.
+	•	losses/stitching_loss.py: SKL en logits del collar + MSE/Procrustes en low-D.
+	•	losses/regularizers.py: L_corr(banco), sparsidad gate, MDL(p/R).
+	•	losses/rate_loss.py: coste en bits del ledger. (Bloque de pérdidas v3.)  
+	•	optim/sda.py: DualSDA() para λ (capacidad visible = bits + flops) y α (complejidad p/R) en log-espacio con paso var-aware. (Duales.)  
+	•	train/metrics.py: ΔBKM collar, entropía, tasa ledger, c_step (constante/MLP tiny), correlación operadores.
+	•	train/hooks.py: should_advance_step(ΔBKM, λ, c_step), drift detector bulk, distilación sólo-borde.
+	•	train/loop.py: forward por ventanas, grads sólo-borde (torch.no_grad() en bulk con refresh adaptativo), update de duales, llamada opcional a Krylov-lazy. (Bucle de entrenamiento.)  
+	•	infer/streamer.py: streaming con memoria ~ (w + bits efectivos), parada por óptimo local y teleports presupuestados (opcional).
+	•	infer/speculative.py: propuesta/rechazo 2–3 pasos desde ledger (adaptable por tasa de rechazo). (Inferencia.)  
+	•	scripts/train_lm.py, eval_lm.py: wiring de config + loop + logging.
+	•	configs/: base.yaml (d=768, k=128, groups=16, p≤10, R≤64, W=512–1024, O=5–10%, d_low≈48, etc.) + variantes de ablación. (Recs iniciales.)  
+
+3) Orden lógico de implementación (fases y checks)
+
+Fase 0 — Andamiaje y utilidades (Día 0)
+0.1 config.py, utils/logging.py, seed.py.
+0.2 utils/windows.py (ventanas+collar) y utils/laplacian.py.
+Si más adelante quieres que te monte el modo Hann “correcto” (√Hann en slice_windows + √Hann en reconstruct_from_windows y padding)
+Checks: tests de ventanas/mascaras; L̃ simétrica y espectro ∈ [−1,1] (modo Chebyshev).  
+
+Fase 1 — Normalización base y gauge (Día 1)
+1.1 modules/normalize.py (traceless groupwise).
+1.2 modules/gauge.py (WeylGauge con EMA de capacidad).
+Checks: var≈1 por grupo tras traceless; gauge estable con s∈[0.5,2]. (Vacío→traza + gauge.)  
+
+Fase 2 — Banco mínimo + Port-Hamiltonian + Integrador básico (Día 2)
+2.1 operators/cheb.py (solo difusivo, deg 6–8).
+2.2 modules/portham.py (R≽0 con softplus; J skew).
+2.3 modules/integrator.py con ETD (disipativo) + leapfrog (ondulatorio), y una versión simple de integrate_until_stop con c_step constante.
+Checks: estabilidad en ruido blanco y señales senoidales; contracción de ΔBKM en collar.  
+
+Fase 3 — Head y loop mínimo de entrenamiento (Día 3)
+3.1 data/tokenize.py (E_V, E_d, tying) + modules/output_head.py.
+3.2 losses/task_loss.py.
+3.3 train/loop.py minimal: ventanas→traceless→gauge→cheb→portham→integrar→head→CE; grads full (temporalmente) para sanity.
+Checks: overfit a un batch pequeño; throughput base. (Embeddings factor.)  
+
+Fase 4 — Gating escaso y resto del banco (Día 4)
+4.1 operators/advective.py, oscillatory.py, lowrank.py.
+4.2 modules/gate.py (entmax/HC) y mezcla de 1–2 ops activos; regularizador de correlación en losses/regularizers.py.
+Checks: gate elige 1–2 ops; caída de flops sin pérdida de calidad; correlación baja entre salidas.  
+
+Fase 5 — Stitching sólo-borde + métricas + parada lazy (Día 5–6)
+5.1 modules/stitching.py: low-D 32–64, Procrustes, SKL en logits collar, ΔBKM.
+5.2 train/metrics.py, train/hooks.py (criterio ΔBKM > λ·c_step).
+5.3 Loop: grads sólo-borde; bulk en no_grad() con refresh por drift.
+Checks: parada reduce pasos (2–4 típicos); mejora tokens/s y memoria; pérdidas sólo-borde activas.  
+
+Fase 6 — Ledger = rate (virtual) (Día 7)
+6.1 modules/ledger.py (modelo de entropía shallow, coarse/fine implícito, olvido).
+6.2 losses/rate_loss.py; logging de bits virtuales y ocupación.
+Checks: la tasa cae cuando no aporta acuerdo; coherencia con parada lazy.  
+
+Fase 7 — Krylov-lazy (Día 8)
+7.1 modules/krylov.py (r=2–3; QR-lite; reinicio).
+7.2 Hook: activar sólo si ΔBKM alta en collar; no acumular.
+Checks: arregla “residuos tercos” con O(d·r); no crece el estado.  
+
+Fase 8 — Duales por SDA (Día 9)
+8.1 optim/sda.py para λ (capacidad visible=bits+flops) y α (complejidad p/R).
+8.2 Integración en loop: actualización en log-space, var-aware.
+Checks: sin serrucho; perfiles de λ/α estables y sensibles al ruido.  
+
+Fase 9 — QAT guiado por capacidad (Día 10–11)
+9.1 modules/quant.py: allocator por grupos/ventana (int4 coef espectrales; int8 mezclas/ledger).
+9.2 Calibración breve post-podado.
+Checks: <1–2% caída de calidad; ahorro claro en memoria/latencia.  
+
+Fase 10 — Distilación y especulativa (Día 12)
+10.1 Distilación sólo-borde (logits y low-D).
+10.2 infer/speculative.py: 2–3 pasos adaptativos desde ledger.
+Checks: speed-up neto sin degradación; rechazo bajo.  
+
+Fase 11 — Inferencia streaming larga distancia (Día 13)
+11.1 infer/streamer.py: memoria ~ (w + bits) en vez de n; parada por óptimo local; teleports opcionales.
+Checks: escalar a contextos largos; estabilidad de estado y del ledger.  
+
+Fase 12 — Tests, ablaciones, presets (Día 14)
+12.1 tests/* unitarios (ventanas, L̃, gate, parada, ledger, krylov).
+12.2 configs/* para ablar: banco 3 vs 4, low-D=32/48/64, r=1/2/3, rate on/off, SDA vs EMA. (Checklist de ablaciones.)  
+
+
+
+Buenísima pregunta. Resumen corto:
+	•	10.1 Distilación sólo-borde → es parte del entrenamiento / fine-tuning (sobre un modelo ya preentrenado/base). Añade una pérdida auxiliar de KD donde el teacher supervisa sólo las “collars” de cada ventana (los O tokens de solape), para ahorrar cómputo y alinear fronteras.
+	•	10.2 Especulativa → es sólo de inferencia. Se implementa en un script nuevo (p. ej. infer/speculative.py) y usa un modelo “borrador” (draft/student) para proponer 2–3 pasos, aceptados/rechazados por el modelo grande. La ledger/capacidad puede decidir dinámicamente si intentas 2 o 3 pasos.
+
+¿Dónde se hace 10.1 en el código?
+	•	train/loop.py: ahí se integra la distilación:
+	•	Carga un teacher (eval, no_grad).
+	•	Calcula logits del teacher solo en las “collars” de cada ventana (los O primeros y O últimos pasos), no en el bulk.
+	•	Pasa esos teacher_logits a la pérdida.
+	•	losses/task_loss.py: ya tenemos CE con soporte de KD (alpha/temperature). Usas esa ruta pasando teacher_logits y mask_kd que marque sólo las collars (el CE “normal” sigue siendo global).
+	•	(Opcional, “low-D”): para distilación low-D, añade una proyección de logits:
+	•	O bien un proyector fijo (top-k, random features, o PCA precomputado) aplicado a teacher y student antes del KL.
+	•	O un cabezal compacto (p. ej., nn.Linear(V, dKD) compartido) que se usa solo dentro de la pérdida (no afecta a la ruta de inferencia).
+	•	Esto se implementa como pequeño helper (p. ej. modules/distill_proj.py) o directo en train/loop.py antes de llamar a la loss.
+
+¿Dónde se hace 10.2?
+	•	infer/speculative.py (nuevo): runtime puro.
+	•	Borrador (student) propone 2–3 tokens.
+	•	Verificador (teacher o el propio modelo grande) acepta o rechaza comparando log-probs.
+	•	Adaptación: con la ledger/capacidad / entropía eliges si intentas 2 o 3 pasos (más pasos cuando la confianza/ capacidad es alta).
+	•	Checks: velocidad (tokens/s), tasa de aceptación alta (rechazo bajo), y perplejidad ≈ a la baseline.
+
+Si te parece, el siguiente paso sería: preparar los puntos de inserción en train/loop.py para KD sólo-borde (sin cambiar nada más) y definir la máscara de collars para el teacher; luego ya montamos infer/speculative.py.
+
+
+Por qué separarla de train/loop.py
+	•	Responsabilidades claras: loop.py = preentreno/sanity E2E. Distilación = fine-tuning con teacher fijado.
+	•	Config distinta: rutas de teacher ckpt, α/τ de KD, máscara de collars, proyección low-D, mezcla con CE, etc.
+	•	Ciclos y métricas propios: tasa de aceptación en collars, ΔPPL vs. base, etc.
+	•	Riesgo: no tocar el bucle base que ya te funciona.
+
+Qué crear
+
+Nuevo script: train/distill.py (reutiliza módulos existentes).
+
+Esqueleto (alto nivel):
+	•	DistillConfig: teacher_ckpt, alpha, temperature, collar_only=True, proj_dim=None (low-D opcional), W/O como en loop, etc.
+	•	Cargar student (tu ContinuousLM) y teacher (mismo tokenizer), poner teacher en eval() y no_grad().
+	•	Reusar slice_windows como en loop.py:
+	•	Para KD: evaluar teacher sólo en collars (O primeros y últimos de cada ventana). No hace falta forward teacher del bulk.
+	•	Construir mask_kd (1 en collars, 0 resto).
+	•	(Opcional) low-D: proyectar logits V→dKD (mismo proyector a teacher y student) antes de KL.
+	•	Llamar a tu loss con KD (ya la tienes en losses/task_loss.py):
+	•	sequence_cross_entropy(..., teacher_logits=teacher_logits_collar, alpha=α, temperature=τ, mask_kd=mask_kd)
+	•	Mantener todo lo demás igual (optimizer, hooks, dual/rate si quieres).
+
+Flujo por batch:
+	1.	student_logits = model.forward_tokens(tokens, mask)
+	2.	teacher_logits_collar = teacher.forward_tokens(tokens, mask)  # extrae sólo collars
+	3.	loss = CE(student) + α·KL(student||teacher)@τ (sólo collars)
+	4.	backward/step.
+
+Dónde entra 10.2 (especulativa)
+	•	Archivo nuevo: infer/speculative.py.
+	•	Usa student como draft para proponer 2–3 tokens; el verificador (teacher o el propio modelo grande) acepta/rechaza.
+	•	Ledger/capacidad decide 2 vs 3 pasos (alta confianza ⇒ más pasos).
+
+Si te parece, te preparo el skeleton de train/distill.py (con máscara de collars y low-D opcional) y luego pasamos a infer/speculative.py.
+
+
+
+#####################
+
+
+1) utils/ema.py
+	•	Por qué ahora: es una util común y sin dependencias. Te servirá en capacity, schedulers y ledger si quieres unificar EMAs.
+	•	Deps: ninguna.
+	•	Integración: donde hoy haces EMAs ad-hoc (gauge/ledger), deja la opción de usar utils.ema.EMA.
+	•	Hecho cuando: puedes crear EMA(alpha).update(x) y hay un test corto que verifica suavizado.
+
+2) utils/capacity.py
+	•	Por qué ahora: desbloquea gauge “real” (capacidad desde entropía/ledger).
+	•	Deps: modules.ledger (ya está), opcionalmente utils.ema.
+	•	Integración: en modules/gauge.py, sustituye el dummy por capacity_signal(logits_collar, stats) (con flag para fallback).
+	•	Hecho cuando: gauge.forward acepta cap externo opcional y si no, llama a capacity_signal; test simple: cap↓ cuando H↑.
+
+3) utils/procrustes.py
+	•	Por qué ahora: lo usa el stitching si quieres separar helpers (ahora están dentro del módulo).
+	•	Deps: numpy/torch; nada del repo.
+	•	Integración: en modules/stitching.py cambia a from utils.procrustes import procrustes, orthobase_fit (deja fallback si no está).
+	•	Hecho cuando: test toy alinea dos bases y el error baja.
+
+4) losses/stitching_loss.py
+	•	Por qué ahora: separa la loss (SKL collar + MSE/Procrustes) de la lógica de modules/stitching.
+	•	Deps: modules.stitching (+ opcional utils.procrustes).
+	•	Integración: en train/loop.py, si activas stitching, suma stitching_loss(...) al total con peso cfg.stitch_w.
+	•	Hecho cuando: en un batch toy, la loss baja al alinear representaciones iguales.
+
+5) data/dataloaders.py
+	•	Por qué ahora: formaliza el pipeline de datos (windows + collars + masks) y limpia loop.py.
+	•	Deps: data/tok_embed.py, utils/windows.py.
+	•	Integración: loop.py usa DataLoader con collate_fn de aquí; exposa máscaras CE/KD/collars.
+	•	Hecho cuando: DataLoader entrega {tokens, mask, targets, mask_kd, mask_ce} y tus tests pasan.
+
+6) utils/logging.py (compat shim)
+	•	Por qué ahora: evitar confusiones con logging_utils.
+	•	Deps: módulo estándar logging.
+	•	Integración: crea utils/logging.py como thin wrapper que re-exporta lo de logging_utils (o renombra imports a logging_utils y deja logging.py con warnings + reexport).
+	•	Hecho cuando: ambos from utils.logging_utils import ... y from utils.logging import ... funcionan.
+
+7) train/checkpoints.py
+	•	Por qué ahora: útil para scripts y distill; no bloquea nada previo.
+	•	Deps: torch; opcional: optim/sda.to_payload.
+	•	Integración: funciones save_ckpt(model,opt,step,extra) / load_ckpt(...) con soporte de payload del dual.
+	•	Hecho cuando: guardas/cargas y obtienes bit-exact en un paso de validación toy.
+
+8) optim/schedulers.py
+	•	Por qué ahora: calidad de vida; no es crítico.
+	•	Deps: torch; opcional: warmup/cosine.
+	•	Integración: en loop.py añade build_scheduler(opt, cfg) y step por iteración/epoch.
+	•	Hecho cuando: imprime LR esperado según step.
+
+9) utils/profile.py
+	•	Por qué ahora: opcional; para medir throughput/memoria.
+	•	Deps: time / torch.cuda.
+	•	Integración: context managers with profile("stage"): y contadores.
+	•	Hecho cuando: logs muestran ms/iter y allocs.
+
+10) scripts/train_lm.py y scripts/eval_lm.py
+	•	Por qué ahora: CLI cómoda sobre todo lo anterior.
+	•	Deps: configs.presets y/o YAML (si luego añades).
+	•	Integración: argparse → construye cfg → llama a train/loop.py/eval.
+	•	Hecho cuando: puedes lanzar python scripts/train_lm.py --preset bank4_r2_rate_on_sda.
+
+(Opcional) 11) YAMLs
+	•	Por qué: reproducibilidad y parametrización externa.
+	•	Deps: omegaconf/yaml.
+	•	Integración: loader que traduce YAML a LoopConfig/DistillConfig; convive con configs/presets.py.
+	•	Hecho cuando: python scripts/train_lm.py --cfg configs/base.yaml crea el mismo cfg que el preset equivalente.
+
+
+

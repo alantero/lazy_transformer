@@ -1,0 +1,400 @@
+# operators/cheb.py
+# Chebyshev polynomial filters over a 1D Laplacian (time axis).
+# Adds: (1) per-group learnable coeffs in Torch, (2) laplacian="path" (Dirichlet BC).
+# NumPy/Torch compatible; no external project deps.
+
+from __future__ import annotations
+from typing import Any, Optional, Sequence, Tuple, Union
+
+# Optional backends
+try:
+    import numpy as _np  # type: ignore
+except Exception:
+    _np = None  # type: ignore
+
+try:
+    import torch as _torch  # type: ignore
+    import torch.nn as _nn  # type: ignore
+    import torch.nn.functional as _F  # type: ignore
+    _HAVE_TORCH = True
+except Exception:
+    _torch = None  # type: ignore
+    _nn = None  # type: ignore
+    _F = None  # type: ignore
+    _HAVE_TORCH = False
+
+
+# -------------------------- backend helpers ----------------------------------
+
+def _is_numpy(x: Any) -> bool:
+    return (_np is not None) and isinstance(x, _np.ndarray)
+
+def _is_torch(x: Any) -> bool:
+    return (_HAVE_TORCH) and isinstance(x, _torch.Tensor)
+
+def _move_axis(x: Any, src: int, dst: int) -> Any:
+    if _is_numpy(x): return _np.moveaxis(x, src, dst)
+    return _torch.movedim(x, src, dst)
+
+def _zeros_like(x: Any) -> Any:
+    if _is_numpy(x): return _np.zeros_like(x, dtype=getattr(x, "dtype", float))
+    return _torch.zeros_like(x)
+
+
+# --------------------------- Laplacian operators ------------------------------
+
+def _lap_cycle(x: Any, axis_time: int = -2) -> Any:
+    """
+    Normalized Laplacian on a cycle graph along `axis_time`:
+      L x = x - 0.5 * (shift_left(x) + shift_right(x))
+    Shapes: [..., T, D]
+    """
+    if axis_time < 0: axis_time += x.ndim
+    xt = _move_axis(x, axis_time, -2)  # [..., T, D]
+    if _is_numpy(xt):
+        left  = _np.roll(xt, shift=+1, axis=-2)
+        right = _np.roll(xt, shift=-1, axis=-2)
+        y = xt - 0.5 * (left + right)
+    else:
+        left  = _torch.roll(xt, shifts=+1, dims=-2)
+        right = _torch.roll(xt, shifts=-1, dims=-2)
+        y = xt - 0.5 * (left + right)
+    return _move_axis(y, -2, axis_time)
+
+def _lap_path_dirichlet(x: Any, axis_time: int = -2) -> Any:
+    """
+    Path (non-periodic) Laplacian with Dirichlet BC (zero outside):
+      L x = x - 0.5 * (x_{i-1} + x_{i+1}) with x_{-1}=x_{T}=0.
+    Shapes: [..., T, D]
+    """
+    if axis_time < 0: axis_time += x.ndim
+    xt = _move_axis(x, axis_time, -2)  # [..., T, D]
+    if _is_numpy(xt):
+        zeros = _np.zeros_like(xt[..., :1, :])
+        left  = _np.concatenate([zeros, xt[..., :-1, :]], axis=-2)
+        right = _np.concatenate([xt[..., 1:, :], zeros], axis=-2)
+        y = xt - 0.5 * (left + right)
+    else:
+        # pad = (last_dim_left, last_dim_right, time_left, time_right)
+        left  = _F.pad(xt, (0, 0, 1, 0), mode="constant", value=0.0)[..., :-1, :]
+        right = _F.pad(xt, (0, 0, 0, 1), mode="constant", value=0.0)[..., 1:, :]
+        y = xt - 0.5 * (left + right)
+    return _move_axis(y, -2, axis_time)
+
+
+def _mu_apply(Lx_fn, x: Any, lmax: float) -> Any:
+    """
+    Apply μ(L) = 2 L / lmax - I.
+    """
+    Lx = Lx_fn(x)
+    if _is_numpy(x):
+        return (2.0 / lmax) * Lx - x
+    else:
+        return (2.0 / lmax) * Lx - x
+
+
+# -------------------------- Chebyshev coefficients ----------------------------
+
+def cheb_coeffs_from_function(f, K: int, *, M: Optional[int] = None) -> "_np.ndarray":
+    """
+    Approximate Chebyshev coeffs c_k for f(μ) on μ∈[-1,1] with Gauss–Chebyshev quadrature.
+    Returns np.array (K+1,). NumPy-only utility (used for heat init).
+    """
+    if _np is None:
+        raise ImportError("NumPy required to generate Chebyshev coefficients.")
+    M = int(M or max(4 * (K + 1), 64))
+    j = _np.arange(M, dtype=float)
+    theta = (j + 0.5) * _np.pi / M
+    mu = _np.cos(theta)
+    vals = _np.asarray(f(mu), dtype=float)
+    w = _np.pi / M
+    c = _np.empty(K + 1, dtype=float)
+    c[0] = (1.0 / _np.pi) * _np.sum(vals * w)
+    for k in range(1, K + 1):
+        c[k] = (2.0 / _np.pi) * _np.sum(vals * _np.cos(k * theta) * w)
+    return c
+
+def heat_cheb_coeffs(K: int, tau: float, lmax: float = 2.0) -> "_np.ndarray":
+    """
+    Chebyshev coeffs for g(λ)=exp(-τ λ) on λ∈[0,lmax], mapped to μ∈[-1,1].
+    """
+    if _np is None:
+        raise ImportError("NumPy required to generate Chebyshev coefficients.")
+    def f(mu):
+        lam = 0.5 * lmax * (mu + 1.0)
+        return _np.exp(-tau * lam)
+    return cheb_coeffs_from_function(f, K)
+
+
+# -------------------------- Chebyshev filtering -------------------------------
+
+def _select_Lx(laplacian: str):
+    if laplacian == "cycle":
+        return _lap_cycle
+    if laplacian == "path":
+        return _lap_path_dirichlet
+    raise ValueError(f"Unsupported laplacian='{laplacian}'. Use 'cycle' or 'path'.")
+
+def cheb_apply(
+    x: Any,
+    coeffs: Sequence[float],
+    *,
+    laplacian: str = "cycle",
+    axis_time: int = -2,
+    lmax: float = 2.0,
+) -> Any:
+    """
+    NumPy/Torch (shared-coeff) Chebyshev filter:
+      y = Σ_{k=0..K} c_k T_k(μ(L)) x,  μ(L)=2L/lmax - I.
+    `coeffs` length is K+1. Shapes preserved: x [..., T, D] -> y [..., T, D].
+    """
+    K = len(coeffs) - 1
+    if K < 0:
+        raise ValueError("coeffs must be non-empty.")
+
+    Lx = _select_Lx(laplacian)
+    mu = lambda v: _mu_apply(Lx, v, lmax=lmax)
+
+    t0 = x
+    y = coeffs[0] * t0
+    if K == 0:
+        return y
+    t1 = mu(t0)
+    y = y + coeffs[1] * t1
+    for k in range(1, K):
+        t2 = 2.0 * mu(t1) - t0
+        y = y + coeffs[k + 1] * t2
+        t0, t1 = t1, t2
+    return y
+
+
+# --------------------------- Torch per-group version --------------------------
+
+def _mul_by_group_coeff(t: _torch.Tensor, ck: _torch.Tensor, groups: int) -> _torch.Tensor:
+    """
+    Multiply [..., T, D] by per-group coeffs ck[G], broadcasting over time and group channels.
+    """
+    *prefix, T, D = t.shape
+    cg = D // groups
+    tg = t.view(*prefix, T, groups, cg)  # [..., T, G, cg]
+    shape = [1] * (tg.ndim - 2) + [groups, 1]
+    return (tg * ck.view(*shape)).view(*prefix, T, D)
+
+def cheb_apply_torch_groupwise(
+    x: _torch.Tensor,
+    coeffs: _torch.Tensor,          # shape [K+1] or [G, K+1]
+    *,
+    groups: int = 1,
+    laplacian: str = "cycle",
+    axis_time: int = -2,
+    lmax: float = 2.0,
+) -> _torch.Tensor:
+    """
+    Torch Chebyshev filter with optional per-group coeffs:
+      - coeffs shape [K+1]: shared across channels
+      - coeffs shape [G, K+1]: groupwise (D % G == 0)
+    """
+    if axis_time != -2:
+        # Keep behavior parity with cheb_apply by moving the axis
+        x = _move_axis(x, axis_time, -2)
+        y = cheb_apply_torch_groupwise(x, coeffs, groups=groups, laplacian=laplacian, axis_time=-2, lmax=lmax)
+        return _move_axis(y, -2, axis_time)
+
+    if coeffs.ndim == 1:
+        # Shared coefficients → fall back to scalar version
+        return cheb_apply(x, coeffs.tolist(), laplacian=laplacian, axis_time=axis_time, lmax=lmax)
+
+    # Groupwise coefficients
+    if x.shape[-1] % groups != 0:
+        raise ValueError(f"D={x.shape[-1]} must be divisible by groups={groups} for groupwise coeffs.")
+    G = coeffs.shape[0]
+    if G != groups:
+        raise ValueError(f"coeffs has G={G} but groups={groups}.")
+
+    Lx = _select_Lx(laplacian)
+    mu = lambda v: _mu_apply(Lx, v, lmax=lmax)
+
+    K = coeffs.shape[1] - 1
+    if K < 0:
+        raise ValueError("coeffs must have at least one column (K+1).")
+
+    # Recurrence
+    t0 = x
+    y = _mul_by_group_coeff(t0, coeffs[:, 0], groups)        # c0 * T0(x)
+    if K == 0:
+        return y
+    t1 = mu(t0)
+    y = y + _mul_by_group_coeff(t1, coeffs[:, 1], groups)    # c1 * T1(x)
+    for k in range(1, K):
+        t2 = 2.0 * mu(t1) - t0
+        y = y + _mul_by_group_coeff(t2, coeffs[:, k + 1], groups)  # ck * Tk
+        t0, t1 = t1, t2
+    return y
+
+
+# ------------------------------- Public modules ------------------------------
+
+if _HAVE_TORCH:
+    class ChebFilter1D(_nn.Module):
+        """
+        Chebyshev filter on a 1D Laplacian.
+        Torch version supports per-group learnable coeffs (G × (K+1)).
+
+        Args:
+            K: polynomial order (non-negative).
+            coeffs: None → create learnable per-group coeffs (randn*0.02);
+                    Tensor of shape [K+1] or [G,K+1] to set initial coeffs.
+            groups: number of feature groups (D % groups == 0).
+            lmax: spectral radius used in μ(L)=2L/lmax − I (≈2 for 'cycle', ≈4 for 'path').
+            laplacian: 'cycle' (default) or 'path' (Dirichlet).
+            learnable: whether coeffs are nn.Parameter.
+        """
+        def __init__(
+            self,
+            K: int,
+            coeffs: Optional[Union[Sequence[float], "_torch.Tensor"]] = None,
+            *,
+            groups: int = 1,
+            lmax: float = 2.0,
+            laplacian: str = "cycle",
+            learnable: bool = True,
+        ):
+            super().__init__()
+            if K < 0:
+                raise ValueError("K must be >= 0.")
+            if groups < 1:
+                raise ValueError("groups must be >= 1.")
+            self.K = int(K)
+            self.groups = int(groups)
+            self.laplacian = laplacian
+            self.lmax = float(lmax)
+
+            if coeffs is None:
+                # Per-group small random init (bank-style)
+                c = _torch.randn(self.groups, self.K + 1, dtype=_torch.float32) * 0.02
+            else:
+                c = _torch.as_tensor(coeffs, dtype=_torch.float32)
+                # Accept [K+1] or [G, K+1]
+                if c.ndim == 1:
+                    c = c.view(1, -1)  # shared → shape [1, K+1]
+                elif c.ndim == 2:
+                    if c.shape[0] not in (1, self.groups):
+                        raise ValueError(f"Provided coeffs has G={c.shape[0]} but groups={self.groups}.")
+                else:
+                    raise ValueError("coeffs must be 1D [K+1] or 2D [G,K+1].")
+            if learnable:
+                self.coeffs = _nn.Parameter(c)
+            else:
+                self.register_buffer("coeffs", c)
+
+        def forward(self, x: _torch.Tensor, *, axis_time: int = -2) -> _torch.Tensor:
+            # If shared coeffs (shape [1,K+1]), broadcast as scalar version
+            if self.coeffs.shape[0] == 1 and self.groups == 1:
+                return cheb_apply(x, self.coeffs[0].tolist(), laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax)
+            return cheb_apply_torch_groupwise(
+                x, self.coeffs, groups=self.groups, laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax
+            )
+else:
+    class ChebFilter1D:
+        """
+        NumPy fallback (shared coeffs only).
+        If `coeffs` is None, uses heat-kernel low-pass init (requires NumPy).
+        """
+        def __init__(
+            self,
+            K: int,
+            coeffs: Optional[Sequence[float]] = None,
+            *,
+            tau: float = 0.5,
+            lmax: float = 2.0,
+            laplacian: str = "cycle",
+        ):
+            if _np is None:
+                raise ImportError("NumPy is required in the no-Torch version.")
+            if K < 0:
+                raise ValueError("K must be >= 0.")
+            self.K = int(K)
+            self.laplacian = laplacian
+            self.lmax = float(lmax)
+            if coeffs is None:
+                self.coeffs = heat_cheb_coeffs(K, tau=tau, lmax=lmax)
+            else:
+                self.coeffs = _np.asarray(coeffs, dtype=float)
+
+        def __call__(self, x: Any, *, axis_time: int = -2) -> Any:
+            return cheb_apply(x, self.coeffs, laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax)
+
+
+# ----------------------------------- __main__ --------------------------------
+
+if __name__ == "__main__":
+    print("[cheb] Sanity tests (low-pass behavior)…")
+    T = 256
+    D = 8
+    low_bin, high_bin = 2, 32
+
+    if _HAVE_TORCH:
+        device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+        t = _torch.arange(T, device=device, dtype=_torch.float32)
+        sig_low = _torch.sin(2 * _torch.pi * (low_bin / T) * t)
+        sig_high = 0.5 * _torch.sin(2 * _torch.pi * (high_bin / T) * t)
+        x = (sig_low + sig_high).view(1, T, 1).repeat(1, 1, D)  # [B=1,T,D]
+
+        # Use a *shared* heat init to validate low-pass (then you can train groupwise).
+        if _np is None:
+            raise RuntimeError("NumPy needed to synthesize heat init for this demo.")
+        K = 8
+        coeff_heat = _torch.tensor(heat_cheb_coeffs(K, tau=0.8, lmax=2.0), dtype=_torch.float32, device=device)
+        filt = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=2.0, laplacian="cycle", learnable=False).to(device)
+        y = filt(x)
+
+        X = _torch.fft.rfft(x[..., 0], dim=-1)  # take one channel
+        Y = _torch.fft.rfft(y[..., 0], dim=-1)
+        gain_low = float((Y.abs()[0, low_bin] / (X.abs()[0, low_bin] + 1e-12)).item())
+        gain_high = float((Y.abs()[0, high_bin] / (X.abs()[0, high_bin] + 1e-12)).item())
+        print(f"  Torch (cycle): low≈{gain_low:.3f}, high≈{gain_high:.3f}")
+        assert gain_low > gain_high + 0.1
+
+        # Also exercise 'path' Laplacian
+        filt_path = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=4.0, laplacian="path", learnable=False).to(device)
+        y2 = filt_path(x)
+        Y2 = _torch.fft.rfft(y2[..., 0], dim=-1)
+        gain_low2 = float((Y2.abs()[0, low_bin] / (X.abs()[0, low_bin] + 1e-12)).item())
+        gain_high2 = float((Y2.abs()[0, high_bin] / (X.abs()[0, high_bin] + 1e-12)).item())
+        print(f"  Torch (path):  low≈{gain_low2:.3f}, high≈{gain_high2:.3f}")
+        assert gain_low2 > gain_high2 + 0.1
+
+        # Finally, instantiate a *groupwise* learnable bank (random init) just to check shapes.
+        bank = ChebFilter1D(K=K, coeffs=None, groups=4, lmax=2.0, laplacian="cycle", learnable=True).to(device)
+        yb = bank(x)  # shape check
+        assert yb.shape == x.shape
+
+    elif _np is not None:
+        t = _np.arange(T, dtype=float)
+        sig_low = _np.sin(2 * _np.pi * (low_bin / T) * t)
+        sig_high = 0.5 * _np.sin(2 * _np.pi * (high_bin / T) * t)
+        x = (sig_low + sig_high).reshape(1, T, 1).repeat(D, axis=-1)  # [1,T,D]
+
+        K = 8
+        filt = ChebFilter1D(K=K, tau=0.8, lmax=2.0, laplacian="cycle")
+        y = filt(x)
+
+        X = _np.fft.rfft(x[..., 0], axis=-1)
+        Y = _np.fft.rfft(y[..., 0], axis=-1)
+        gain_low = float(_np.abs(Y[0, low_bin]) / (_np.abs(X[0, low_bin]) + 1e-12))
+        gain_high = float(_np.abs(Y[0, high_bin]) / (_np.abs(X[0, high_bin]) + 1e-12))
+        print(f"  NumPy (cycle): low≈{gain_low:.3f}, high≈{gain_high:.3f}")
+        assert gain_low > gain_high + 0.1
+
+        # path (Dirichlet) with lmax≈4
+        filt_path = ChebFilter1D(K=K, tau=0.8, lmax=4.0, laplacian="path")
+        y2 = filt_path(x)
+        Y2 = _np.fft.rfft(y2[..., 0], axis=-1)
+        gain_low2 = float(_np.abs(Y2[0, low_bin]) / (_np.abs(X[0, low_bin]) + 1e-12))
+        gain_high2 = float(_np.abs(Y2[0, high_bin]) / (_np.abs(X[0, high_bin]) + 1e-12))
+        print(f"  NumPy (path):  low≈{gain_low2:.3f}, high≈{gain_high2:.3f}")
+        assert gain_low2 > gain_high2 + 0.1
+    else:
+        raise RuntimeError("Neither NumPy nor Torch is available.")
+
+    print("[cheb] All good ✓")

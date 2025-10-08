@@ -1,0 +1,369 @@
+Lazy v3 Continuous Transformer (CLO) — Arquitectura completa y lista para implementar
+
+A continuación tienes el documento de referencia de la arquitectura que hemos seleccionado como la mejor, reuniendo todas las decisiones y ajustes “lazy v3” que acordamos. Empiezo desde cero (del discreto al continuo) y luego describo todas las capas y sus reglas de entrenamiento/inferencia, con notas de estabilidad, complejidad y esqueletos de código para que no se pierda nada.
+
+⸻
+
+0) Del discreto al continuo: mapa conceptual
+
+0.1 Secuencia → campo continuo
+	•	Antes (discreto): tokens x_1,\dots,x_n, embeddings e_i\in\mathbb{R}^d, capas apiladas.
+	•	Después (continuo): una función f:[0,1]\to\mathbb{R}^d que representa la secuencia (indexamos cada ventana local en [0,1]). Trabajamos con muestras uniformes (o adaptativas) dentro de la ventana; no necesitamos almacenar un embedding por token, sino representar transformaciones como operadores.
+
+0.2 Posición/estructura → operador (no “pos encodings”)
+	•	Reemplazamos la codificación posicional por una estructura espectral: el dominio 1D induce un Laplaciano normalizado \tilde L (o su análogo convolutivo/FFT), y construimos operadores como polinomios de Chebyshev T_k(\tilde L) o núcleos (FFT/Nyström).
+	•	La escala no se ajusta con un heat-kernel global; en v3 la fija la capacidad local (sección “gauge Weyl por capacidad”), véase §2.2.
+
+0.3 Profundidad → tiempo continuo
+	•	Las “capas” pasan a ser pasos de integración de un flujo:
+\frac{\partial h(x,t)}{\partial t} = Fh
+En nuestro caso, F se construye como operador físico estable (port-Hamiltonian) más no linealidades muy baratas. La parada de pasos se decide por optimal stopping lazy (criterio ΔBKM vs coste), no por un número fijo de capas.
+
+0.4 Principios lazy v3 que guían TODO
+	•	Solo-borde visible (stitching): solo lo que pasa por el collar (zona solapada) afecta a lo observable; el resto es “bulk”.
+	•	Capacidad holográfica: la capacidad del borde (ledger + coste en collar) es el recurso; lo regulamos con un dual \lambda.
+	•	Vacío → traza: componentes isotrópicas/volumétricas no deben consumir parámetros ni bits; se proyectan fuera (traceless).
+	•	Mínima actualización (selector lazy): avanzamos únicamente mientras la mejora visible supera el coste (ΔBKM > \lambda·coste).
+
+⸻
+
+1) Arquitectura completa (bloques y capas)
+
+1.1 Tokenización y embedding factorizado
+	•	Vocab: V.
+	•	Embedding factor: elegimos k \ll d.
+	•	Matriz de entrada: E_V\in\mathbb{R}^{V\times k} y proyección E_d\in\mathbb{R}^{k\times d}. Peso de salida atado: logits = h→k→E_V^\top.
+	•	Ventanas: partimos secuencias en ventanas de longitud W con solape O (5–10%). Cada ventana se renormaliza a [0,1].
+
+Ventajas: baja parámetros (V·k + k·d), facilita tying y QAT posterior.
+
+⸻
+
+1.2 Capa de normalización “vacío a la traza” + gauge por capacidad
+	•	Traceless por grupos: reordenamos canales en G grupos de tamaño g=d/G. Para cada grupo restamos la media (el modo isotrópico) y normalizamos su “volumen” (norma).
+Efecto: eliminamos offsets volumétricos antes de cualquier cómputo o cuantización.
+	•	Gauge Weyl por capacidad: calculamos una señal de capacidad local (entropía en collar + ocupación del ledger), la filtramos (EMA + conv1D pequeña) y producimos un factor de escala s(x) global·local que reescala suavemente las activaciones.
+Efecto: estabiliza (no hay “exploding”), y el operador usa solo la escala que el borde demanda.
+
+Regla: siempre aplicar traceless+gauge antes de cuantizar o de pasar por el operador.
+
+⸻
+
+1.3 Banco mínimo de operadores compartidos + gating escaso
+
+Mantenemos un banco pequeño (3–4), compartido a lo largo de la profundidad (tiempo). Cada operador tiene muy pocos parámetros:
+	1.	Difusivo (Chebyshev sobre \tilde L): grado p \le 10.
+	2.	Transportivo (convolución causal ligera / “advección”).
+	3.	Oscilatorio (núcleo seno/cos o convolución oscilatoria).
+	4.	Low-rank corto (integral Nyström con rango pequeño R) — opcional.
+
+	•	Gating: un gater muy pequeño (condicionado solo por features del collar) decide pesos escasos (usamos entmax o Hard-Concrete L0 para activar 1–2 operadores).
+	•	Ortonormalidad y anticorrelación: inicializamos el banco de forma ortonormal y añadimos penalización de correlación entre salidas (medida solo en el collar) para evitar solapes innecesarios.
+
+Por qué: el borde elige lo mínimo que necesita (no mezclas densas). Esto reduce flops y evita “sobre-render”.
+
+⸻
+
+1.4 Operador físico estable: port-Hamiltonian + traceless
+
+Combinamos las salidas del banco en una forma port-Hamiltonian:
+A = (J - R)\,G, \quad J=-J^\top,\;\; R\succeq 0
+	•	R garantiza disipación (contracción de ΔBKM).
+	•	J permite ondas (no mata oscilatorios/código/música).
+	•	G es un escalado/mezcla por grupos (barato) para mapear al espacio de trabajo.
+Trabajamos siempre en canales traceless; cualquier modo isotrópico se proyecta fuera.
+
+Parámetros: muy pocos (coeficientes de Chebyshev, kernels depthwise, pequeños pesos de mezcla por grupo). Comparten a lo largo del tiempo.
+
+⸻
+
+1.5 Integrador de profundidad (tiempo) y parada lazy
+	•	Integración:
+	•	Parte disipativa (R): ETD (exponential time differencing) o Chebyshev para e^{\Delta t\,(-RG)}.
+	•	Parte ondulatoria (J): paso symplectic (leapfrog/Stormer–Verlet) para estabilidad de ondas.
+	•	2–4 pasos típicos; no fijamos L capas, paramos por optimal stopping.
+	•	Parada óptima (lazy): avanzamos solo si la mejora visible supera el coste del paso:
+\Delta\mathrm{BKM}{\text{collar}} > \lambda \cdot c{\text{step}}
+donde c_{\text{step}} es un proxy barato del coste (constante medida o un MLP minúsculo regularizado). Con esto evitamos histéresis/umbrales “a mano”.
+
+⸻
+
+1.6 Stitching en el collar (solo-borde)
+	•	Proyección low-D aprendida (32–64 dims): una base ortonormal compartida (con re-ortho perezoso) para el collar; trabajamos ahí para alinear.
+	•	Alineación barata: Procrustes (o simil) en ese subespacio y SKL en los logits solo del collar.
+	•	Señales: de aquí salen las métricas de acuerdo (ΔBKM/ΔKL), entropía del collar y la demanda para el ledger.
+
+⸻
+
+1.7 Ledger = rate (bits), no K fijo
+	•	En v3 el recurso real del borde son bits; el ledger se regulariza por rate (log-prob de un modelo de entropía shallow).
+	•	Virtual rate: durante entrenamiento no codificamos físicamente; optimizamos la tasa. Codificamos de verdad solo si compensa (inferencias críticas).
+	•	Coarse/fine implícito: el coste de bits fuerza coarse (Kc) y activa fine (Kl) solo cuando mejora el acuerdo.
+	•	Olvido: se decide por rate y por el dual \lambda (si la tasa es cara y no mejora, se borra).
+	•	Sin conos: no imponemos velocidad finita; el ruteo se hace por demanda (stitching + rate), y podemos añadir teleports presupuestados si alguna tarea puntual lo requiere (opcional).
+
+⸻
+
+1.8 Corrección local mínima: Krylov-lazy
+	•	Si el collar detecta que el operador base no basta (ΔBKM alta), aplicamos una corrección local en un subespacio de Krylov de 2–3 vectores generados con el residuo del collar; QR ligero y reinicio (no acumulamos).
+	•	Efecto: resolvemos exactamente la demanda del borde con coste O(d\cdot r), sin inflar rangos ni parámetros persistentes.
+
+⸻
+
+1.9 Cuantización guiada por capacidad (bits = área)
+	•	Pre-quant: siempre traceless + norm por grupo antes de cuantizar (int4/int8).
+	•	Allocator: asigna bits por grupo/ventana según capacidad (demanda del collar); si la tasa es baja, no gastamos bits altos.
+	•	QAT: quant-aware training mixto (coeficientes espectrales en int4, mezclas/ledger en int8).
+
+⸻
+
+1.10 Cabeza de salida y tying
+	•	Proyección d→k y matriz E_V^\top (tying) para logits.
+	•	Tareas: LM causal/seq2seq, etc. Con todas las pérdidas auxiliares “solo-borde” (ver §2).
+
+⸻
+
+2) Objetivos y reglas de entrenamiento (lazy-v3)
+
+2.1 Pérdidas
+	•	Task loss (LM): cross-entropy causal.
+	•	Stitching loss:
+	•	Procrustes/MSE en el subespacio low-D del collar (representaciones).
+	•	SKL solo en logits del collar.
+	•	Regularizadores del banco:
+	•	Correlación (evitar solapes de operadores).
+	•	Sparsidad de gating (entmax/L0).
+	•	Rate del ledger: coste en bits (modelo de entropía), sin codificación física en training.
+	•	MDL (p/R): complejidad del operador (codelength) regulada por un dual \alpha.
+
+2.2 Capacidad/Complejidad como duales (sin PID)
+	•	\lambda (capacidad visible = bits ledger + flops de collar) y \alpha (complejidad p/R) se actualizan con Stochastic Dual Averaging en log-espacio (mantienen positividad), con paso adaptado por varianza para evitar serrucho en datos ruidosos.
+
+2.3 Parada óptima (inferencia y training)
+	•	Paso de tiempo (profundidad) avanza si \Delta\mathrm{BKM}{\text{collar}} > \lambda\cdot c{\text{step}}.
+	•	En entrenamiento, grads solo en el borde: el bulk va en no_grad() (cada N pasos hacemos un refresh adaptativo si un detector de drift del bulk lo pide).
+
+2.4 Distilación y especulativa (solo-borde)
+	•	Distilación: del teacher al student solo en el collar (logits y proyecciones low-D).
+	•	Especulativa: solo del ledger (2–3 pasos; adaptable por tasa de rechazo).
+
+⸻
+
+3) Complejidad, memoria y parámetros (órdenes de magnitud)
+	•	Parámetros del core: pasan de O(L d^2) (Transformer clásico) a:
+	•	Banco (pocos coeficientes por operador, compartidos)
+	•	Gater minúsculo
+	•	Mezcla por grupos (O(d·groups))
+	•	Sin adapters densos (Krylov-lazy no acumula)
+	•	Embedding factor: V\cdot k + k\cdot d en vez de V\cdot d.
+	•	Memoria KV: O((w+capacity_bits)·d) por ventana en vez de O(n·d).
+	•	Flops: atención densa O(n^2d) → O(n\log n\,d) (FFT) o O(n\,p\,d) (Chebyshev), parada reduce pasos; banco escaso evita sumar todos los operadores.
+
+En práctica, para un “equivalente GPT-2 small” podemos operar en ~2–4 M de parámetros efectivos (dependiendo de k, p, R y d), con memoria y flops ×10–×20 mejores en contextos largos gracias a ventana+stitching+rate.
+
+⸻
+
+4) Esqueletos de código (ingles, sin acentos)
+
+Nota: son esqueletos para anclar decisiones; omito detalles de inicializacion y utilidades.
+
+4.1 Traceless + gauge
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def traceless_groupwise(x, groups=16, eps=1e-6):
+    B,T,D = x.shape
+    G = D // groups
+    y = x.view(B,T,G,groups)
+    m = y.mean(dim=-1, keepdim=True)
+    y = y - m
+    s = (y.pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt()
+    y = y * s
+    return y.view(B,T,D)
+
+class WeylGauge(nn.Module):
+    def __init__(self, d, ksize=3):
+        super().__init__()
+        self.conv = nn.Conv1d(d, d, ksize, padding=ksize//2, groups=d, bias=False)
+        nn.init.constant_(self.conv.weight, 0.0)
+
+    def forward(self, h, cap_signal, smin=0.5, smax=2.0):
+        # cap_signal: [B,T,1] (entropy + ledger usage), pre-smoothed/EMA
+        s = cap_signal.clamp(smin, smax)
+        s = s.transpose(1,2)                # [B,1,T]
+        s = self.conv(s.repeat(1,h.size(-1),1)).transpose(1,2)  # depthwise smooth
+        return h * s
+
+4.2 Banco de operadores (difusivo/adv/oscilatorio/low-rank)
+
+class ChebOp(nn.Module):
+    def __init__(self, d, groups=16, deg=8):
+        super().__init__()
+        self.groups = groups
+        self.deg = deg
+        self.coeff = nn.Parameter(torch.zeros(d // groups, deg+1))
+        nn.init.normal_(self.coeff, std=0.02)
+    def forward(self, h, L):
+        # h: [B,T,D], L: [T,T] normalized laplacian
+        B,T,D = h.shape; g = self.groups; G = D // g
+        T0 = h; T1 = torch.einsum('tt,btd->btd', L, h)
+        acc = self.coeff[:,0].view(1,1,G,1)*T0.view(B,T,G,g)
+        acc += self.coeff[:,1].view(1,1,G,1)*T1.view(B,T,G,g)
+        Tk_2, Tk_1 = T0, T1
+        for k in range(2, self.deg+1):
+            Tk = 2*torch.einsum('tt,btd->btd', L, Tk_1) - Tk_2
+            acc += self.coeff[:,k].view(1,1,G,1)*Tk.view(B,T,G,g)
+            Tk_2, Tk_1 = Tk_1, Tk
+        return acc.view(B,T,D)
+
+class AdvectiveOp(nn.Module):
+    def __init__(self, d, kernel=5):
+        super().__init__()
+        self.dw = nn.Conv1d(d, d, kernel, groups=d, padding=kernel//2, bias=False)
+    def forward(self, h):
+        return self.dw(h.transpose(1,2)).transpose(1,2)
+
+class OscOp(nn.Module):
+    def __init__(self, d, modes=16):
+        super().__init__()
+        self.freq = nn.Parameter(torch.randn(modes))
+        self.mix  = nn.Linear(2*modes, d, bias=False)
+    def forward(self, h):
+        B,T,D = h.shape
+        t = torch.linspace(0,1,T, device=h.device).view(1,T,1)
+        s = []
+        for w in self.freq:
+            s.append(torch.sin(2*torch.pi*w*t))
+            s.append(torch.cos(2*torch.pi*w*t))
+        S = torch.cat(s, dim=-1)            # [B?,T,2m]
+        return self.mix(S)                  # broadcasted to [T,2m]->[T,D]
+
+class LowRankOp(nn.Module):
+    def __init__(self, d, rank=64):
+        super().__init__()
+        self.U = nn.Linear(d, rank, bias=False)
+        self.V = nn.Linear(d, rank, bias=False)
+        self.P = nn.Linear(rank, d, bias=False)
+    def forward(self, h):
+        B,T,D = h.shape
+        v = self.V(h).mean(dim=1)          # [B,R]
+        return self.P(v).unsqueeze(1).expand_as(h)
+
+4.3 Gating escaso (collar-only)
+
+class SparseGate(nn.Module):
+    def __init__(self, d_in=64, hidden=64, n_ops=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.GELU(),
+            nn.Linear(hidden, n_ops)
+        )
+    def forward(self, collar_feats):
+        # collar_feats: [B, d_in] (pooled features on the overlap)
+        logits = self.net(collar_feats)
+        # entmax or hard-concrete L0; here softmax as placeholder
+        w = torch.softmax(logits, dim=-1)  # replace with entmax/L0
+        return w
+
+4.4 Port-Hamiltonian + integrador ETD-symplectic (esqueleto)
+
+class PortHamiltonianStep(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.G = nn.Linear(d, d, bias=False)  # groupwise in practice
+        self.R_scale = nn.Parameter(torch.tensor(0.1))
+        self.J_scale = nn.Parameter(torch.tensor(0.1))
+    def forward(self, h, y_diff, y_adv, y_osc, y_lra, dt):
+        # combine bank outputs into (J-R)G h proxy
+        y = y_diff + y_adv + y_osc + y_lra
+        z = self.G(y)
+        # split dissipative J/R parts (schematic)
+        dissip = -F.softplus(self.R_scale) * z
+        wave   =  self.J_scale * (z - z.transpose(0,0))  # placeholder skew idea
+        # ETD for dissip, symplectic for wave (pseudo)
+        h1 = h + dt * dissip
+        h2 = h1 + dt * wave  # replace with leapfrog for stability
+        return h2
+
+4.5 Krylov-lazy (corrección local reiniciada)
+
+def krylov_lazy_correction(apply_A, r0, steps=2):
+    # apply_A: function R^d -> R^d restricted to collar directions
+    # r0: residual on the collar [B, d]
+    K = [r0]
+    for _ in range(steps-1):
+        v = apply_A(K[-1])
+        # orthogonalize (QR-lite)
+        for u in K:
+            v = v - (v*u).sum(-1, keepdim=True) * u
+        v = v / (v.norm(dim=-1, keepdim=True) + 1e-6)
+        K.append(v)
+    # single correction in span(K)
+    # (solve tiny LS in that basis; omitted)
+    return K[0]  # placeholder direction
+
+4.6 Stitching en low-D y pérdidas “solo-borde”
+
+def overlap_agreement_kl(logits_a, logits_b, mask):
+    p = F.log_softmax(logits_a, dim=-1).exp()
+    q = F.log_softmax(logits_b, dim=-1).exp()
+    kl_pq = (p * (p.log() - q.log())).sum(-1)
+    kl_qp = (q * (q.log() - p.log())).sum(-1)
+    skl = 0.5*(kl_pq + kl_qp)
+    return (skl*mask).sum() / (mask.sum().clamp_min(1))
+
+
+⸻
+
+5) Bucle de entrenamiento (resumen operativo)
+	1.	Batch → ventanas W con solape O.
+	2.	Traceless + gauge en cada ventana.
+	3.	Banco + port-Hamiltonian (compartidos) y integración por pasos; parada con \Delta\mathrm{BKM} > \lambda c_{\text{step}}.
+	4.	Stitching en low-D del collar (Procrustes + SKL); rate del ledger (virtual).
+	5.	Krylov-lazy si el collar lo pide; sin acumular.
+	6.	Grads solo-borde; refresh adaptativo del bulk si detector de drift lo sugiere.
+	7.	Actualiza duales \lambda,\alpha (SDA log-space) con var-aware.
+	8.	QAT mixto progresivo (int4/8), distilación solo-borde, especulativa del ledger adaptativa.
+
+⸻
+
+6) Inferencia (streaming y larga distancia)
+	•	Streaming por ventanas con solape y ledger de rate; memoria depende de w + bits efectivos, no de n.
+	•	Parada por óptimo local paso a paso; Krylov-lazy solo si el collar lo pide.
+	•	Opcional: teleports presupuestados si una tarea concreta lo requiere.
+
+⸻
+
+7) Valores iniciales recomendados (texto/código)
+	•	d=768, k=128, groups=16, p≤10, R≤64, pasos ETD-symp 2–4, W=512–1024, O=5–10%, collar low-D=48.
+	•	Gating entmax/L0 (2 ops medios), rate target bajo (ledger muy comprimido).
+	•	Duales: \lambda y \alpha con SDA var-aware; \epsilon (objetivo de ΔBKM) pequeño y fijo.
+	•	QAT: coeficientes espectrales int4, mezclas/ledger int8, re-calibración breve tras pruning.
+
+⸻
+
+8) Checklist de ablaciones (para registrar resultados)
+	•	Banco: 3 vs 4 operadores; entmax vs L0; correlación on/off.
+	•	p/R: fijo vs MDL dual.
+	•	Stitching: low-D=32/48/64; re-ortho cada N vs perezoso por ΔBKM.
+	•	Krylov: r=1/2/3; restart vs acumulado (debe ganar restart).
+	•	Rate ledger: modelo de entropía shallow 1/2/3 mezclas; codificación real on/off.
+	•	Parada: coste proxy constante vs MLP tiny; comparar tokens/s y calidad.
+	•	Duales: SDA vs EMA/PID (debe ganar SDA).
+	•	Grads: full vs border-only (debe ganar border-only en memoria/estabilidad).
+
+⸻
+
+9) Qué no cambiar (decisiones clave v3)
+	•	Sin conos: no aportan ahorro real aquí; ruteo por stitching + rate ya es perezoso.
+	•	Traceless en todas las rutas: ancla de QAT y de “vacío a la traza”.
+	•	Capacidad como dual: evita controllers manuales; es la regla única que gobierna bits y coste visible.
+	•	Krylov-lazy: no acumular rangos ni adapters permanentes.
+
+⸻
+
+Cierre
+
+Con este documento tienes toda la arquitectura y el procedimiento (del discreto al continuo, capas, pérdidas, regla de parada, ledger por rate, gating escaso, operador estable, entrenamiento e inferencia). Es lo que acordamos como “mejor stack” y está listo para implementarlo módulo a módulo. Si quieres, te genero una plantilla de proyecto (carpetas y archivos) con estos esqueletos y un loop de entrenamiento base para empezar a correr pruebas.
