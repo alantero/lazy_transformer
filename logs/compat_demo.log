@@ -1,0 +1,7 @@
+2025-10-08 13:41:49,266 | DEBUG    | r0 | lazyclo: [compat] debug line
+2025-10-08 13:41:49,268 | INFO     | r0 | lazyclo: [compat] info line; backend = utils.logging_utils (sys.path injected)
+2025-10-08 13:41:49,269 | ERROR    | r0 | lazyclo: [compat] example exception
+Traceback (most recent call last):
+  File "/Users/agus/repositories/lazy_transformer/utils/logging_shim.py", line 93, in <module>
+    1 / 0
+ZeroDivisionError: division by zero

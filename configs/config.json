@@ -1,0 +1,58 @@
+{
+  "model_type": "lazy-transformer",
+  "architectures": ["ContinuousLM"],
+  "torch_dtype": "float32",
+
+  "W": 16,
+  "O": 4,
+
+  "vocab_size": 128,
+  "d_model": 64,
+  "groups": 8,
+
+  "cheb_deg": 6,
+  "cheb_laplacian": "cycle",
+
+  "skew_rank": 8,
+  "R_rank": 4,
+
+  "steps": 2,
+  "dt": 0.5,
+  "method": "heun",
+
+  "tie_softmax": true,
+  "factor_rank": 16,
+  "pos_kind": "sinusoidal",
+  "pad_id": 0,
+
+  "lr": 0.003,
+  "weight_decay": 0.0,
+  "device": "cpu",
+
+  "use_gauge": true,
+
+  "stitch_w": 0.1,
+  "stitch_use_lowd": true,
+  "stitch_use_skl": false,
+
+  "scheduler_name": "warmup_cosine",
+  "scheduler_total_steps": 200,
+  "scheduler_warmup_steps": 20,
+  "scheduler_min_lr": 0.0003,
+  "scheduler_cycles": 0.5,
+
+  "plateau_factor": 0.5,
+  "plateau_patience": 200,
+  "plateau_ema_alpha": 0.9,
+  "plateau_threshold": 0.001,
+  "plateau_minimize": true,
+
+  "profile": false,
+  "profile_nvtx": false,
+  "profile_log_mem": false,
+
+  "checkpoint_dir": "./ckpts",
+  "save_every": 0,
+  "keep_last_k": 5,
+  "best_metric_name": "loss"
+}

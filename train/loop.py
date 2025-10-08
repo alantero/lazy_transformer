@@ -24,6 +24,13 @@ try:
 except Exception:
     from data.tokenize import TokenEmbedder, SimpleVocab, pack_batch   # fallback
 
+# Optionally import dataloaders utilities (collate_batch, build_collar_mask)
+try:
+    from data.dataloaders import collate_batch as _collate_batch, build_collar_mask as _build_collar_mask  # type: ignore
+except Exception:
+    _collate_batch = None  # type: ignore
+    _build_collar_mask = None  # type: ignore
+
 from utils.windows import slice_windows, reconstruct_from_windows
 from modules.normalize import groupwise_norm
 from operators.cheb import ChebFilter1D
@@ -35,6 +42,10 @@ from losses.rate_loss import bits_per_token
 from losses.stitching_loss import StitchingOverlapLoss
 from optim.sda import DualSDA
 from modules.quant import calibrate_model, toggle_fakequant_collect
+from train.checkpoints import CheckpointManager  # checkpoint management
+from optim.schedulers import make_scheduler  # learning-rate schedulers
+from utils.profile import Timer, record_function as prof_record_function, nvtx_range, ThroughputMeter, gpu_mem
+from contextlib import nullcontext
 
 
 # ------------------------------ optional gauge --------------------------------
@@ -113,6 +124,34 @@ class LoopConfig:
     quant_calibrate_after_prune: bool = True
     quant_calib_batches: int = 64
     freeze_qparams_after_calib: bool = True
+
+    # checkpoints
+    checkpoint_dir: str = "_tmp_ckpts"
+    save_every: int = 0            # 0 = disable periodic saves
+    keep_last_k: int = 5
+    best_metric_name: str = "loss" # which stat to track as "best" (e.g., 'loss' or 'bpp')
+    resume_path: Optional[str] = None
+
+
+
+    # scheduler (optional)
+    scheduler_name: Optional[str] = None  # e.g., 'warmup_cosine', 'warmup_linear', 'noam', 'plateau'
+    scheduler_total_steps: int = 0        # if 0, demo will default to 40
+    scheduler_warmup_steps: int = 0
+    scheduler_min_lr: float = 0.0
+    scheduler_cycles: float = 0.5         # only for cosine
+
+    # plateau-specific
+    plateau_factor: float = 0.5
+    plateau_patience: int = 200
+    plateau_ema_alpha: float = 0.9
+    plateau_threshold: float = 1e-3
+    plateau_minimize: bool = True
+
+    # profiling (optional)
+    profile: bool = False           # measure wall time per step and compute tokens/sec
+    profile_nvtx: bool = False      # wrap steps in NVTX ranges (Nsight)
+    profile_log_mem: bool = False   # log CUDA memory (allocated/reserved)
 
 
 # ----------------------------------- model ------------------------------------
@@ -452,22 +491,74 @@ if __name__ == "__main__":
     texts = ["hello there", "general kenobi", "hello hello"]
     vocab = SimpleVocab.build_from_texts(texts, mode="char", add_unk=False)
     seqs = [vocab.encode(t, mode="char", add_bos=True, add_eos=True) for t in texts]
-    tokens, mask = pack_batch(seqs, pad_id=vocab.pad_id)
-    batch = {"tokens": tokens, "mask": mask, "targets": tokens.clone()}
-
-    cfg = LoopConfig(
-        W=16, O=4,
-        vocab_size=vocab.size, d_model=64, groups=8,
-        cheb_deg=6, cheb_laplacian="cycle",
-        skew_rank=8, R_rank=4,
-        steps=2, dt=0.5, method="heun",
-        tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
-        pad_id=vocab.pad_id,
-        lr=3e-3, weight_decay=0.0,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        use_gauge=True,
-        stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
-    )
+    # Prefer the dataloader collate if available; fallback to pack_batch otherwise
+    if _collate_batch is not None:
+        bos_id = getattr(vocab, "bos_id", None)
+        eos_id = getattr(vocab, "eos_id", None)
+        batch = _collate_batch(seqs, pad_id=vocab.pad_id, bos_id=bos_id, eos_id=eos_id, max_len=None)
+        # Optional: collar mask for overlaps (not strictly needed by the model yet)
+        if _build_collar_mask is not None:
+            lens = batch["mask"].sum(dim=1).tolist()
+            cfg = LoopConfig(
+                W=16, O=4,
+                vocab_size=vocab.size, d_model=64, groups=8,
+                cheb_deg=6, cheb_laplacian="cycle",
+                skew_rank=8, R_rank=4,
+                steps=2, dt=0.5, method="heun",
+                tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
+                pad_id=vocab.pad_id,
+                lr=3e-3, weight_decay=0.0,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                use_gauge=True,
+                stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
+                scheduler_name="warmup_cosine",
+                scheduler_total_steps=40,
+                scheduler_warmup_steps=5,
+                scheduler_min_lr=3e-4,
+            )
+            batch["collar_mask"] = _build_collar_mask(lens, W=cfg.W, O=cfg.O)
+        else:
+            cfg = LoopConfig(
+                W=16, O=4,
+                vocab_size=vocab.size, d_model=64, groups=8,
+                cheb_deg=6, cheb_laplacian="cycle",
+                skew_rank=8, R_rank=4,
+                steps=2, dt=0.5, method="heun",
+                tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
+                pad_id=vocab.pad_id,
+                lr=3e-3, weight_decay=0.0,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                use_gauge=True,
+                stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
+                scheduler_name="warmup_cosine",
+                scheduler_total_steps=40,
+                scheduler_warmup_steps=5,
+                scheduler_min_lr=3e-4,
+            )
+    else:
+        tokens, mask = pack_batch(seqs, pad_id=vocab.pad_id)
+        batch = {"tokens": tokens, "mask": mask, "targets": tokens.clone()}
+        cfg = LoopConfig(
+            W=16, O=4,
+            vocab_size=vocab.size, d_model=64, groups=8,
+            cheb_deg=6, cheb_laplacian="cycle",
+            skew_rank=8, R_rank=4,
+            steps=2, dt=0.5, method="heun",
+            tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
+            pad_id=vocab.pad_id,
+            lr=3e-3, weight_decay=0.0,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            use_gauge=True,
+            stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
+            scheduler_name="warmup_cosine",
+            scheduler_total_steps=40,
+            scheduler_warmup_steps=5,
+            scheduler_min_lr=3e-4,
+            profile=True,
+            profile_nvtx=False,
+            profile_log_mem=True,
+            
+        )
 
     device = torch.device(cfg.device)
     model = ContinuousLM(cfg).to(device)
@@ -477,6 +568,62 @@ if __name__ == "__main__":
         batch[k] = batch[k].to(device)
 
     opt = build_optimizer(model, cfg)
+
+    # Throughput meter for profiling
+    tm = ThroughputMeter()
+
+
+    # Optional LR scheduler
+    sch = None
+    if cfg.scheduler_name:
+        name = cfg.scheduler_name.lower()
+        # total steps default for the demo if unspecified
+        total_steps = cfg.scheduler_total_steps if cfg.scheduler_total_steps > 0 else 40
+        if name in ("warmup_cosine", "cosine"):
+            sch = make_scheduler(
+                name, opt,
+                total_steps=total_steps,
+                warmup_steps=max(0, cfg.scheduler_warmup_steps),
+                base_lr=cfg.lr,
+                min_lr=cfg.scheduler_min_lr,
+                cycles=cfg.scheduler_cycles,
+            )
+        elif name in ("warmup_linear", "linear"):
+            sch = make_scheduler(
+                name, opt,
+                total_steps=total_steps,
+                warmup_steps=max(0, cfg.scheduler_warmup_steps),
+                base_lr=cfg.lr,
+                min_lr=cfg.scheduler_min_lr,
+            )
+        elif name == "noam":
+            sch = make_scheduler(
+                name, opt,
+                d_model=cfg.d_model,
+                warmup_steps=max(1, cfg.scheduler_warmup_steps or 4000),
+                scale=1.0,
+            )
+        elif name in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+            sch = make_scheduler(
+                "plateau", opt,
+                factor=cfg.plateau_factor,
+                patience=cfg.plateau_patience,
+                ema_alpha=cfg.plateau_ema_alpha,
+                threshold=cfg.plateau_threshold,
+                minimize=cfg.plateau_minimize,
+                base_lr=cfg.lr,
+                min_lr=cfg.scheduler_min_lr,
+            )
+
+
+
+    # Checkpoint manager (periodic + best)
+    ckpt_mgr = CheckpointManager(
+        cfg.checkpoint_dir,
+        keep_last_k=cfg.keep_last_k,
+        best_tag=cfg.best_metric_name,
+        is_better=(lambda new, best: (best is None) or (new < best)),
+    )
 
     # Optional: brief post-pruning calibration (Phase 3, 9.2)
     if cfg.quant_calibrate_after_prune:
@@ -492,9 +639,54 @@ if __name__ == "__main__":
     # Overfit a single batch a few steps (sanity)
     steps = 40
     for s in range(steps):
-        stats = train_step(model, batch, opt)
+        # Profiling: measure step wall time (CUDA-synced) and wrap with optional NVTX
+        if cfg.profile or cfg.profile_nvtx:
+            timer = Timer(sync_cuda=True)
+            ctx = nvtx_range(f"step_{s}") if cfg.profile_nvtx else nullcontext()
+            with ctx, prof_record_function("train_step"):
+                timer.start()
+                stats = train_step(model, batch, opt)
+                dt = timer.stop()  # seconds
+            # Update throughput (items = tokens processed this step)
+            tok = int(stats.get("tokens", 0))
+            if tok > 0:
+                tm.update(tok, dt)
+        else:
+            stats = train_step(model, batch, opt)
+            dt = None
+
+        cur_lr = opt.param_groups[0]["lr"]
+        extra_prof = ""
+        if cfg.profile and tm.time_s > 0:
+            extra_prof += f", ips={tm.ips:.1f}"  # tokens per second
+        if cfg.profile_log_mem and torch.cuda.is_available():
+            m = gpu_mem()
+            extra_prof += f", gpuMB={m['allocated']:.1f}/{m['reserved']:.1f}"
         if (s % 5) == 0 or s == steps - 1:
-            logging.info(f"step {s:02d} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} | tokens={int(stats.get('tokens', 0))}")
+            logging.info(
+                f"step {s:02d} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} "
+                f"| tokens={int(stats.get('tokens', 0))} | lr={cur_lr:.2e}{extra_prof}"
+            )
+
+        # Periodic checkpoint save
+        ckpt_mgr.periodic_save(
+            model=model, optimizer=opt, scheduler=None,
+            step=s, epoch=0, cfg=cfg, every=cfg.save_every,
+            extra={"tokens_seen": int(stats.get("tokens", 0))},
+        )
+        # Update best using chosen metric (fallback to loss)
+        metric_name = cfg.best_metric_name
+        metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
+        ckpt_mgr.update_best(
+            metric_value=metric_val,
+            model=model, optimizer=opt, scheduler=None,
+            step=s, epoch=0, cfg=cfg,
+            extra={metric_name: metric_val},
+        )
+
+        # Step scheduler (supports metric-driven and step-driven)
+        if sch is not None:
+            sch.step(s, metrics=float(stats.get("loss", 0.0)))
 
     # Forward-only throughput sanity
     model.eval()
