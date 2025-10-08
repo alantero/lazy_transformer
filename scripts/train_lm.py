@@ -24,6 +24,8 @@ if __package__ in (None, ""):
 
 import torch
 import torch.nn as nn
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
 # --- Project imports (robust fallbacks where possible) ------------------------
 try:
@@ -122,6 +124,89 @@ def merge_cfg(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
+# ------------------------------ NPY Dataset ---------------------------------
+class NpyPackedDataset(Dataset):
+    """
+    Loads a .npy memmap with shape [N, seq_len] containing GPT-2 token IDs (int32).
+    Returns torch.long tensors. Collate will shift to build targets.
+    """
+    def __init__(self, path: str):
+        assert os.path.exists(path), f"File not found: {path}"
+        self.path = path
+        self.arr = np.load(path, mmap_mode="r")  # [N, S] int32
+
+    def __len__(self) -> int:
+        return int(self.arr.shape[0])
+
+    def __getitem__(self, idx: int):
+        x = np.asarray(self.arr[idx], dtype=np.int32)  # 1D [S]
+        return torch.as_tensor(x, dtype=torch.long)
+
+def _infer_or_check_seq_len_from_npy(cfg, train_path: str) -> int:
+    """Ensure cfg.W matches dataset seq_len (or set it if missing)."""
+    have = int(np.load(train_path, mmap_mode="r").shape[1])
+    want = getattr(cfg, "W", None)
+    # The model uses window size W; our packed windows are exactly seq_len.
+    if want is None or want <= 0:
+        setattr(cfg, "W", have)
+        logging.info(f"[data] W not set in cfg; inferred W={have} from {train_path}")
+    elif want != have:
+        logging.warning(f"[data] dataset seq_len ({have}) != cfg.W ({want}); using cfg.W but verify your packing.")
+    return have
+
+def _npy_collate(seq_len: int):
+    """Stack to [B,S] then shift to tokens/targets; add trivial mask of ones."""
+    def _fn(batch):
+        x = torch.stack(batch, dim=0)               # [B, S]
+        tokens  = x[:, :seq_len-1]                   # [B, S-1]
+        targets = x[:, 1:seq_len]                    # [B, S-1]
+        mask    = torch.ones_like(tokens, dtype=torch.bool)
+        return {"tokens": tokens, "targets": targets, "mask": mask}
+    return _fn
+
+def build_npy_dataloaders(
+    cfg,
+    train_path: str,
+    val_path: str,
+    micro_batch_size: int = 8,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    drop_last: bool = True,
+):
+    """Create DataLoaders from pre-packed NPY windows."""
+    seq_len = _infer_or_check_seq_len_from_npy(cfg, train_path)
+    train_ds = NpyPackedDataset(train_path)
+    val_ds   = NpyPackedDataset(val_path)
+    collate  = _npy_collate(seq_len)
+
+    # (Optional) DDP samplers if user launches with torchrun
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size > 1:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=drop_last
+        )
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+        shuffle_train = False
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle_train = True
+
+    train_loader = DataLoader(
+        train_ds, batch_size=micro_batch_size, shuffle=shuffle_train, sampler=train_sampler,
+        num_workers=num_workers, pin_memory=pin_memory, drop_last=drop_last, collate_fn=collate
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=micro_batch_size, shuffle=False, sampler=val_sampler,
+        num_workers=num_workers, pin_memory=pin_memory, drop_last=False, collate_fn=collate
+    )
+    logging.info(f"[data] train {tuple(train_ds.arr.shape)}  val {tuple(val_ds.arr.shape)}  seq_len={seq_len}")
+    return train_loader, val_loader, seq_len
+
+
 # ------------------------------ CLI / Main ------------------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -170,6 +255,15 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Logging level
     p.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    # NPY dataset (pre-packed windows)
+    p.add_argument("--train-npy", dest="train_npy", type=str, default=None,
+                   help="Path to train.npy (packed [N, seq_len] token IDs).")
+    p.add_argument("--val-npy", dest="val_npy", type=str, default=None,
+                   help="Path to val.npy (packed [N, seq_len] token IDs).")
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=8,
+                   help="Micro batch size per step when using NPY dataset.")
+    p.add_argument("--num-workers", dest="num_workers", type=int, default=4,
+                   help="DataLoader workers for NPY dataset.")
     return p
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -236,16 +330,161 @@ def main(argv: Optional[List[str]] = None) -> None:
     steps = args.steps if args.steps is not None else (cfg.scheduler_total_steps or 400)
 
     # --- Data -----------------------------------------------------------------
-    texts = load_texts(args.text_file)
-    vocab = SimpleVocab.build_from_texts(texts, mode="char", add_unk=False)
-    batch, _ = build_batch_from_texts(texts, vocab, cfg.W, cfg.O)
+    use_npy = (args.train_npy is not None) and (args.val_npy is not None)
+    last_batch = None
 
-    # --- Model / Optim / Scheduler / Ckpt ------------------------------------
+    if use_npy:
+        # Build DataLoaders from pre-packed NPY windows
+        train_loader, val_loader, seq_len = build_npy_dataloaders(
+            cfg,
+            train_path=args.train_npy,
+            val_path=args.val_npy,
+            micro_batch_size=int(args.batch_size),
+            num_workers=int(args.num_workers),
+            pin_memory=True,
+            drop_last=True,
+        )
+        device = torch.device(cfg.device)
+        model = ContinuousLM(cfg).to(device)
+        opt = build_optimizer(model, cfg)
+        sch = None
+        if cfg.scheduler_name:
+            name = cfg.scheduler_name.lower()
+            total_steps = cfg.scheduler_total_steps if cfg.scheduler_total_steps > 0 else steps
+            if name in ("warmup_cosine", "cosine"):
+                sch = make_scheduler(
+                    name, opt,
+                    total_steps=total_steps,
+                    warmup_steps=max(0, cfg.scheduler_warmup_steps),
+                    base_lr=cfg.lr,
+                    min_lr=cfg.scheduler_min_lr,
+                    cycles=getattr(cfg, "scheduler_cycles", 0.5),
+                )
+            elif name in ("warmup_linear", "linear"):
+                sch = make_scheduler(
+                    name, opt,
+                    total_steps=total_steps,
+                    warmup_steps=max(0, cfg.scheduler_warmup_steps),
+                    base_lr=cfg.lr,
+                    min_lr=cfg.scheduler_min_lr,
+                )
+            elif name == "noam":
+                sch = make_scheduler(
+                    name, opt,
+                    d_model=cfg.d_model,
+                    warmup_steps=max(1, cfg.scheduler_warmup_steps or 4000),
+                    scale=1.0,
+                )
+            elif name in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+                sch = make_scheduler(
+                    "plateau", opt,
+                    factor=getattr(cfg, "plateau_factor", 0.5),
+                    patience=getattr(cfg, "plateau_patience", 200),
+                    ema_alpha=getattr(cfg, "plateau_ema_alpha", 0.9),
+                    threshold=getattr(cfg, "plateau_threshold", 1e-3),
+                    minimize=getattr(cfg, "plateau_minimize", True),
+                    base_lr=cfg.lr,
+                    min_lr=cfg.scheduler_min_lr,
+                )
+        ckpt_mgr = CheckpointManager(
+            cfg.checkpoint_dir,
+            keep_last_k=cfg.keep_last_k,
+            best_tag=cfg.best_metric_name,
+            is_better=(lambda new, best: (best is None) or (new < best)),
+        )
+        if cfg.resume_path:
+            try:
+                from train.checkpoints import load_checkpoint  # type: ignore
+                ckpt = load_checkpoint(cfg.resume_path, model=model, optimizer=opt, scheduler=None, strict_model=False)
+                logging.info(f"[ckpt] resumed from {cfg.resume_path} (step={ckpt.get('step')}, epoch={ckpt.get('epoch')})")
+            except Exception as e:
+                logging.warning(f"[ckpt] resume failed: {e}")
+
+        tm = ThroughputMeter() if ThroughputMeter is not None else None
+        device_ctx = torch.cuda.amp.autocast if (cfg.device == "cuda" and hasattr(torch.cuda, "amp")) else nullcontext  # type: ignore
+
+        # --- Train loop over DataLoader ---------------------------------------
+        train_iter = iter(train_loader)
+        for s in range(steps):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+
+            # Move to device
+            for k in ("tokens", "targets", "mask"):
+                if k in batch:
+                    batch[k] = batch[k].to(device, non_blocking=True)
+
+            if cfg.profile and Timer is not None:
+                timer = Timer(sync_cuda=True)
+                with (nvtx_range(f"step_{s}") if args.profile_nvtx else torch.autograd.profiler.record_function("train_step")):
+                    timer.start()
+                    stats = train_step(model, batch, opt)
+                    dt = timer.stop()
+                if tm is not None:
+                    tok = int(stats.get("tokens", 0))
+                    if tok > 0:
+                        tm.update(tok, dt)
+            else:
+                stats = train_step(model, batch, opt)
+
+            last_batch = batch  # keep last for sanity forward
+
+            # Logs
+            if (s % max(1, int(args.log_interval))) == 0 or s == steps - 1:
+                lr = opt.param_groups[0]["lr"]
+                msg = f"step {s}/{steps} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} | bpp={stats.get('bpp', 0.0):.3f} | lr={lr:.2e}"
+                if cfg.profile and tm is not None and tm.time_s > 0:
+                    msg += f" | ips={tm.ips:.1f}"
+                if cfg.profile_log_mem and torch.cuda.is_available():
+                    m = gpu_mem()
+                    msg += f" | gpuMB={m['allocated']:.1f}/{m['reserved']:.1f}"
+                logging.info(msg)
+
+            # Checkpoints
+            ckpt_mgr.periodic_save(
+                model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
+                every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
+            )
+            metric_name = cfg.best_metric_name
+            metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
+            ckpt_mgr.update_best(
+                metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
+                step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+            )
+
+            if sch is not None:
+                sch.step(s, metrics=float(stats.get("loss", 0.0)))
+
+        # End-of-run sanity forward
+        model.eval()
+        with torch.no_grad():
+            ref = last_batch if last_batch is not None else next(iter(val_loader))
+            logits, *_ = model.forward_tokens(ref["tokens"], ref.get("mask", None))
+            B, T, V = logits.shape
+            print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
+
+        # Optionally save resolved config in HF style
+        if args.hf_save is not None and save_hf_config is not None:
+            try:
+                out_path = save_hf_config(cfg, args.hf_save)
+                logging.info(f"[hf] saved resolved config to: {out_path}")
+            except Exception as e:
+                logging.warning(f"[hf] failed to save HF config: {e}")
+        return
+    else:
+        # Fallback: toy/text mode (previous behavior)
+        texts = load_texts(args.text_file)
+        vocab = SimpleVocab.build_from_texts(texts, mode="char", add_unk=False)
+        batch, _ = build_batch_from_texts(texts, vocab, cfg.W, cfg.O)
+
+    # --- Model / Optim / Scheduler / Ckpt (text fallback) --------------------
     device = torch.device(cfg.device)
     model = ContinuousLM(cfg).to(device)
     for k in list(batch.keys()):
         batch[k] = batch[k].to(device)
-
     opt = build_optimizer(model, cfg)
 
     sch = None
@@ -294,6 +533,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         best_tag=cfg.best_metric_name,
         is_better=(lambda new, best: (best is None) or (new < best)),
     )
+
+    # Resume (optional) — mirror NPY branch behavior
     if cfg.resume_path:
         try:
             from train.checkpoints import load_checkpoint  # type: ignore
@@ -302,14 +543,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception as e:
             logging.warning(f"[ckpt] resume failed: {e}")
 
-    # Profiling meter
     tm = ThroughputMeter() if ThroughputMeter is not None else None
 
-    # --- Train loop -----------------------------------------------------------
     for s in range(steps):
         if cfg.profile and Timer is not None:
             timer = Timer(sync_cuda=True)
-            with (nvtx_range(f"step_{s}") if cfg.profile_nvtx else torch.autograd.profiler.record_function("train_step")):
+            with (nvtx_range(f"step_{s}") if args.profile_nvtx else torch.autograd.profiler.record_function("train_step")):
                 timer.start()
                 stats = train_step(model, batch, opt)
                 dt = timer.stop()
@@ -320,7 +559,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             stats = train_step(model, batch, opt)
 
-        # Logs
         if (s % max(1, int(args.log_interval))) == 0 or s == steps - 1:
             lr = opt.param_groups[0]["lr"]
             msg = f"step {s}/{steps} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} | bpp={stats.get('bpp', 0.0):.3f} | lr={lr:.2e}"
@@ -331,7 +569,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 msg += f" | gpuMB={m['allocated']:.1f}/{m['reserved']:.1f}"
             logging.info(msg)
 
-        # Periodic & best checkpoints
         ckpt_mgr.periodic_save(
             model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
             every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
@@ -343,19 +580,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
         )
 
-        # Scheduler step
         if sch is not None:
             sch.step(s, metrics=float(stats.get("loss", 0.0)))
 
-    # Optionally save resolved config in HF style
-    if args.hf_save is not None and save_hf_config is not None:
-        try:
-            out_path = save_hf_config(cfg, args.hf_save)
-            logging.info(f"[hf] saved resolved config to: {out_path}")
-        except Exception as e:
-            logging.warning(f"[hf] failed to save HF config: {e}")
-
-    # Quick forward-only sanity at the end
     model.eval()
     with torch.no_grad():
         logits, *_ = model.forward_tokens(batch["tokens"], batch.get("mask", None))
