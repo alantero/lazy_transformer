@@ -25,6 +25,12 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+# GenerationMixin import (version-safe)
+try:
+    from transformers.generation.utils import GenerationMixin
+except Exception:  # transformers < 4.44 fallback
+    from transformers.generation import GenerationMixin
+
 # Ensure repository root is importable regardless of CWD
 import sys
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -69,6 +75,11 @@ class CLOHFConfig(PretrainedConfig):
         **kwargs
     ):
         super().__init__(**kwargs)
+        # Default special tokens for HF compatibility
+        self.eos_token_id = 50256
+        self.bos_token_id = None
+        # Signal HF generation that caching is supported (we return a dummy cache)
+        self.use_cache = True
         self.vocab_size = vocab_size
         self.W = W
         self.O = O
@@ -90,21 +101,10 @@ class CLOHFConfig(PretrainedConfig):
         self.stitch_use_lowd = stitch_use_lowd
         self.stitch_use_skl = stitch_use_skl
 
-    # For generate() compatibility
-    @property
-    def eos_token_id(self):
-        # Use GPT-2 EOS (50256) by default
-        return 50256
-
-    @property
-    def bos_token_id(self):
-        # GPT-2 does not use BOS by default; keep None
-        return None
-
 
 # ------------------------------ HF Model Wrapper -----------------------------
 
-class CLOForCausalLM(PreTrainedModel):
+class CLOForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = CLOHFConfig
 
     def __init__(self, config: CLOHFConfig):
@@ -139,7 +139,13 @@ class CLOForCausalLM(PreTrainedModel):
         **kwargs
     ):
         # The inner model accepts (tokens, mask) and returns logits [B, T, V]
-        logits, *_ = self.inner.forward_tokens(input_ids, attention_mask)
+        out = self.inner.forward_tokens(input_ids, attention_mask)   # expected (logits, y_win, logits_win) in your impl
+        if isinstance(out, (list, tuple)) and len(out) >= 2:
+            logits = out[0]
+            last_hidden = out[1]   # [B, T, D] pre-softmax representation
+        else:
+            logits = out
+            last_hidden = None
         loss = None
         if labels is not None:
             # standard next-token cross-entropy (shifted)
@@ -148,16 +154,25 @@ class CLOForCausalLM(PreTrainedModel):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size),
                             shift_labels.view(-1))
+        # Expose a minimal dummy cache (non-empty tuple) to satisfy HF contrastive search checks.
+        # We do not actually use kv-cache; prepare_inputs_for_generation ignores it and windows by W.
+        dummy_cache = ((),)
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=None,  # we do not implement cache in this wrapper
-            hidden_states=None,
+            past_key_values=dummy_cache,
+            hidden_states=None if last_hidden is None else [last_hidden],
             attentions=None
         )
 
     # Methods to let generate() run without kv-cache
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
+        # Ignore past_key_values and always feed full (or windowed) context.
+        # Optionally window by config.W to avoid unbounded growth.
+        if input_ids.size(1) > self.config.W:
+            input_ids = input_ids[:, -self.config.W:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -self.config.W:]
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     def _reorder_cache(self, past_key_values, beam_idx):
@@ -176,13 +191,29 @@ def load_clo_hf(
     with open(hf_config_path, "r") as f:
         raw = json.load(f)
 
-    # Force pos_kind="sinusoidal" to match training fallback
-    raw.setdefault("pos_kind", "sinusoidal")
+    # Ensure positional encoding is compatible with runtime
+    # If the config requests learned embeddings (which require max_len in your TokenEmbedder),
+    # fall back to sinusoidal to match training.
+    if str(raw.get("pos_kind", "sinusoidal")).lower() == "learned":
+        print("[cfg] pos_kind='learned' detected; falling back to 'sinusoidal' for inference (no max_len).")
+        raw["pos_kind"] = "sinusoidal"
+    else:
+        raw.setdefault("pos_kind", "sinusoidal")
 
     cfg = CLOHFConfig(**raw)
     model = CLOForCausalLM(cfg)
-    # Load weights from your training checkpoint
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # Robust checkpoint loader (handles PyTorch 2.6+ weights_only default)
+    import inspect
+    _sig = inspect.signature(torch.load)
+    if "weights_only" in _sig.parameters:
+        try:
+            # Try safer path first
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except Exception as e:
+            print(f"[load] weights_only=True failed ({e}); retrying with weights_only=False (trusted local checkpoint)")
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    else:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
     state = ckpt.get("model", ckpt)  # supports {'model': state_dict} or raw state_dict
     missing, unexpected = model.inner.load_state_dict(state, strict=False)
     print(f"[load] missing={len(missing)} unexpected={len(unexpected)}")
@@ -347,9 +378,16 @@ if __name__ == "__main__":
         ))
 
     elif args.method == "contrastive":
+        # Contrastive search in HF requires a proper kv-cache; our model does not implement it.
+        # Fall back to a contrastive-like setup using typical decoding so generation does not error.
+        print("[warn] contrastive search requires kv-cache; falling back to typical decoding (typical_p + temperature).")
         gen_kwargs.update(dict(
-            penalty_alpha=args.penalty_alpha,
-            top_k=max(1, args.top_k),
+            do_sample=True,
+            typical_p=max(1e-3, min(0.999, args.typical_p if args.typical_p else 0.9)),
+            temperature=args.temperature,
+            # keep some diversity controls
+            top_k=args.top_k,
+            top_p=args.top_p,
         ))
 
     with torch.inference_mode():
@@ -366,3 +404,4 @@ if __name__ == "__main__":
         model.save_pretrained(args.export_dir)
         tok.save_pretrained(args.export_dir)
         print(f"[export] Saved HF-compatible model+tokenizer to: {args.export_dir}")
+

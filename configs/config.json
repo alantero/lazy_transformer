@@ -1,95 +1,45 @@
 {
-  "experiment": {
-    "name": "clo30m_vs_gpt2small_30Mtoks",
-    "seed": 42
-  },
-  "tokenizer": {
-    "name_or_path": "gpt2",
-    "vocab_size": 50257,
-    "eos_token_id": 50256,
-    "pad_token_id": 50256,
-    "padding_side": "left"
-  },
-  "data": {
-    "type": "pretokenized_npy",
-    "train_glob": "data/fwe_tok/train_*.npy",
-    "val_glob": "data/fwe_tok/val_*.npy",
-    "seq_len": 1024,
-    "pack_sequences": true,
-    "shuffle": true,
-    "shuffle_buffer_shards": 32,
-    "drop_last": true
-  },
-  "model": {
-    "arch": "CLOv3",
-    "vocab_size": 50257,
-    "d_model": 384,
-    "n_layers": 12,
-    "k_middle": 128,
-    "groups": 16,
-    "embedding": {
-      "factorized": true,
-      "k_tok": 256,
-      "tie_output": true,
-      "positional": "learned"
-    },
-    "operator_bank": {
-      "diffusive": { "cheb_deg": 8 },
-      "advective": { "kernel_size": 3, "causal": true },
-      "oscillatory": { "n_freq": 8 },
-      "nystrom": { "rank": 64 }
-    },
-    "gating": {
-      "type": "entmax15",
-      "temperature": 0.7,
-      "sparsity_target": 0.3,
-      "decorrelation_penalty": 0.01
-    },
-    "collar": {
-      "window_size": 1024,
-      "overlap": 64,
-      "collar_dim": 48
-    },
-    "norm": { "type": "group_weyl", "groups": 16 },
-    "dropout": 0.15
-  },
-  "train": {
-    "train_tokens": 30000000,
-    "global_batch_size": 128,
-    "micro_batch_size": 8,
-    "grad_accum_steps": 16,
-    "max_steps": 230,
-    "log_interval": 10,
-    "eval_interval": 50,
-    "ckpt_interval": 50,
-    "precision": "bf16",
-    "grad_clip_norm": 1.0
-  },
-  "optimizer": {
-    "name": "adamw",
-    "lr": 0.0005,
-    "betas": [0.9, 0.95],
-    "eps": 1e-8,
-    "weight_decay": 0.1
-  },
-  "scheduler": {
-    "type": "cosine",
-    "warmup_steps": 200,
-    "min_lr_ratio": 0.1
-  },
-  "eval": {
-    "metrics": ["ppl"],
-    "ood": {
-      "wikitext103": {
-        "hf_dataset": "Salesforce/wikitext",
-        "subset": "wikitext-103-v1",
-        "split": "test"
-      }
-    }
-  },
-  "logging": {
-    "backend": "wandb",
-    "project": "lazy_transformer",
-    "tags": ["CLOv3", "30M", "FWE-gpt2tok", "1024ctx", "30Mtokens"]
-  }
+  "W": 1024,
+  "O": 64,
+
+  "vocab_size": 50256,
+  "d_model": 384,
+  "groups": 16,
+
+  "cheb_deg": 8,
+  "cheb_laplacian": "cycle",
+  "skew_rank": 8,
+  "R_rank": 4,
+
+  "steps": 2,
+  "dt": 0.5,
+  "method": "heun",
+
+  "tie_softmax": true,
+  "factor_rank": 64,
+  "pos_kind": "sinusoidal",
+  "pad_id": 50256,
+
+  "lr": 0.0005,
+  "weight_decay": 0.1,
+  "device": "cuda",
+  "use_gauge": true,
+
+  "stitch_w": 0.10,
+  "stitch_use_lowd": true,
+  "stitch_use_skl": false,
+
+  "scheduler_name": "warmup_cosine",
+  "scheduler_total_steps": 230,
+  "scheduler_warmup_steps": 200,
+  "scheduler_min_lr": 0.00005,
+
+  "profile": false,
+  "profile_nvtx": false,
+  "profile_log_mem": false,
+
+  "checkpoint_dir": "ckpts/clo30m_owt",
+  "save_every": 50,
+  "keep_last_k": 5,
+  "best_metric_name": "loss"
 }
