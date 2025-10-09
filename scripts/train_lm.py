@@ -725,12 +725,17 @@ def main(argv: Optional[List[str]] = None) -> None:
                 logging.info(f"[ckpt] resume start_step={start_step}")
             except Exception as e:
                 logging.warning(f"[ckpt] resume failed: {e}")
+        # Advance scheduler to match resume step (kind-aware)
+        sched_kind = (cfg.scheduler_name or "").lower() if cfg.scheduler_name else ""
         try:
             if sch is not None and start_step > 0:
-                # Advance scheduler state to match resumed step (best-effort).
-                sch.step(start_step - 1, metrics=None)
+                if sched_kind in ("warmup_cosine", "cosine", "warmup_linear", "linear", "noam"):
+                    for _ in range(start_step):
+                        sch.step()
+                elif sched_kind in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+                    logging.info("[sched] ReduceLROnPlateau cannot be fast-forwarded reliably without metrics; leaving scheduler state as-is.")
         except Exception as e:
-            logging.warning(f"[sched] failed to advance scheduler to step {start_step-1}: {e}")
+            logging.warning(f"[sched] failed to advance scheduler to step {start_step}: {e}")
 
         tm = ThroughputMeter() if ThroughputMeter is not None else None
         device_ctx = torch.cuda.amp.autocast if (cfg.device == "cuda" and hasattr(torch.cuda, "amp")) else nullcontext  # type: ignore
@@ -825,6 +830,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "bpp": f"{stats.get('bpp', 0.0):.3f}",
                 "lr": f"{lr:.2e}",
             }
+            # Optional finer-grained losses if the model reports them
+            ce_val = stats.get("ce", stats.get("lm_ce"))
+            st_val = stats.get("stitch", stats.get("stitch_loss"))
+            if ce_val is not None:
+                postfix["ce"] = f"{float(ce_val):.4f}"
+            if st_val is not None:
+                postfix["stitch"] = f"{float(st_val):.4f}"
             if cfg.profile and tm is not None and tm.time_s > 0:
                 postfix["ips"] = f"{tm.ips:.1f}"
             pbar.set_postfix(postfix)
@@ -855,8 +867,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                         step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
                     )
 
+            # Scheduler step: non-plateau every step; plateau only on validation
             if sch is not None:
-                sch.step(s, metrics=float(stats.get("loss", 0.0)))
+                if sched_kind in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+                    if ran_val:
+                        sch.step(metric_val)
+                else:
+                    sch.step()
 
         # End-of-run sanity forward
         model.eval()
@@ -893,12 +910,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         batch[k] = batch[k].to(device)
     opt = build_optimizer(model, cfg)
 
-
     if args.debug_sanity:
         model.eval()
         run_sanity_checks(model, batch, cfg)
         model.train()
-
 
     sch = None
     if cfg.scheduler_name:
@@ -940,6 +955,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 min_lr=cfg.scheduler_min_lr,
             )
 
+    # Define scheduler kind for later use
+    sched_kind = (cfg.scheduler_name or "").lower() if cfg.scheduler_name else ""
+
     ckpt_mgr = CheckpointManager(
         cfg.checkpoint_dir,
         keep_last_k=cfg.keep_last_k,
@@ -957,11 +975,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             logging.info(f"[ckpt] resume start_step={start_step}")
         except Exception as e:
             logging.warning(f"[ckpt] resume failed: {e}")
+    # Advance scheduler to match resume step (kind-aware)
     try:
         if sch is not None and start_step > 0:
-            sch.step(start_step - 1, metrics=None)
+            if sched_kind in ("warmup_cosine", "cosine", "warmup_linear", "linear", "noam"):
+                for _ in range(start_step):
+                    sch.step()
+            elif sched_kind in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+                logging.info("[sched] ReduceLROnPlateau cannot be fast-forwarded reliably without metrics; leaving scheduler state as-is.")
     except Exception as e:
-        logging.warning(f"[sched] failed to advance scheduler to step {start_step-1}: {e}")
+        logging.warning(f"[sched] failed to advance scheduler to step {start_step}: {e}")
 
     tm = ThroughputMeter() if ThroughputMeter is not None else None
 
@@ -987,6 +1010,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             "bpp": f"{stats.get('bpp', 0.0):.3f}",
             "lr": f"{lr:.2e}",
         }
+        # Optional finer-grained losses if the model reports them
+        ce_val = stats.get("ce", stats.get("lm_ce"))
+        st_val = stats.get("stitch", stats.get("stitch_loss"))
+        if ce_val is not None:
+            postfix["ce"] = f"{float(ce_val):.4f}"
+        if st_val is not None:
+            postfix["stitch"] = f"{float(st_val):.4f}"
         if cfg.profile and tm is not None and tm.time_s > 0:
             postfix["ips"] = f"{tm.ips:.1f}"
         pbar_txt.set_postfix(postfix)
@@ -1003,8 +1033,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                 step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
             )
 
+        # Scheduler step: non-plateau every step; plateau only on validation
+        # For text fallback, always use stats for metric_val
+        metric_name = cfg.best_metric_name
+        metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
         if sch is not None:
-            sch.step(s, metrics=float(stats.get("loss", 0.0)))
+            if sched_kind in ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"):
+                sch.step(metric_val)
+            else:
+                sch.step()
 
     model.eval()
     with torch.no_grad():
