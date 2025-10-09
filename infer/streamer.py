@@ -140,16 +140,20 @@ def typical_filtering(logits: Tensor, p: float = 0.9) -> Tensor:
     logp = torch.log_softmax(logits, dim=-1)
     pvals = logp.exp()
     self_info = -logp
-    mu = (pvals * self_info).sum(dim=-1, keepdim=True)
-    dev = torch.abs(self_info - mu)
-    sorted_dev, sorted_idx = torch.sort(dev, dim=-1)
-    sorted_p = torch.gather(pvals, -1, sorted_idx)
+    dev = torch.abs(self_info - (pvals * self_info).sum(dim=-1, keepdim=True))  # deviation from typical SI
+    # sort by deviation (ascending), keep the minimal-mass set whose cumulative prob >= p
+    order = torch.argsort(dev, dim=-1)  # [B, V]
+    sorted_p = torch.gather(pvals, -1, order)
     csum = torch.cumsum(sorted_p, dim=-1)
-    cutoff = (csum >= p).float().argmax(dim=-1, keepdim=True)
-    mask = torch.arange(logits.size(-1), device=logits.device).unsqueeze(0) > cutoff
-    mask = torch.gather(mask, -1, torch.argsort(sorted_idx, dim=-1))
+    # Build a mask of tokens to drop (True=drop). Start all dropped, then un-drop the prefix.
+    drop = torch.ones_like(logits, dtype=torch.bool)
+    B, V = logits.shape
+    for b in range(B):
+        k = int((csum[b] >= p).nonzero(as_tuple=False)[0].item())  # index of cutoff (inclusive)
+        keep_idx = order[b, :k+1]
+        drop[b, keep_idx] = False
     out = logits.clone()
-    out[mask] = -float("inf")
+    out[drop] = -float("inf")
     return out
 
 def min_p_filtering(logits: Tensor, min_p: float = 0.0) -> Tensor:
@@ -418,16 +422,33 @@ if __name__ == "__main__":
     from transformers import GPT2TokenizerFast
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
+    tok.model_max_length = 10_000_000
     vocab_from_tok = int(tok.vocab_size)
     pad_from_tok = int(tok.eos_token_id)
 
-    # Build model config from raw + tokenizer; ensure vocab_size > pad_id
+    # --- Load checkpoint (for weights and possibly cfg) ---
+    try:
+        state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    except Exception as e:
+        print(f"[load] weights_only=True failed ({e}); retrying with weights_only=False (trusted local checkpoint)")
+        state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+    # If checkpoint carries a config, prefer it for core dims (protects against mismatches)
+    ckcfg = None
+    if isinstance(state, dict):
+        ckcfg = state.get("cfg") or state.get("config") or None
+    if isinstance(ckcfg, dict):
+        for k in ["W","O","vocab_size","pad_id","tie_softmax","d_model","groups",
+                  "cheb_deg","cheb_laplacian","skew_rank","R_rank","factor_rank",
+                  "pos_kind","use_gauge"]:
+            if k in ckcfg:
+                raw[k] = ckcfg[k]
+
+    # Build model config from (raw ⟵ maybe-ckpt ⟵ tokenizer guards)
     vocab_cfg = int(raw.get("vocab_size", vocab_from_tok) or vocab_from_tok)
     pad_cfg = int(raw.get("pad_id", pad_from_tok))
     vocab_final = max(vocab_cfg, vocab_from_tok, pad_cfg + 1)
-    pad_final = pad_cfg
-    if pad_final >= vocab_final:
-        pad_final = vocab_final - 1
+    pad_final = pad_cfg if pad_cfg < vocab_final else (vocab_final - 1)
 
     cfg_m = LoopConfig(
         W=raw.get("W", 1024), O=raw.get("O", 64),
@@ -447,17 +468,28 @@ if __name__ == "__main__":
     device = torch.device(args.device)
     model = ContinuousLM(cfg_m).to(device).eval()
 
-    try:
-        state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    except Exception as e:
-        print(f"[load] weights_only=True failed ({e}); retrying with weights_only=False (trusted local checkpoint)")
-        state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model.load_state_dict(state.get("model", state), strict=False)
+    # Load weights (accept both {'model': sd} and raw sd)
+    sd = state.get("model", state) if isinstance(state, dict) else state
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"[load] missing keys: {len(missing)} e.g. {missing[:5]}")
+    if unexpected:
+        print(f"[load] unexpected keys: {len(unexpected)} e.g. {unexpected[:5]}")
 
-    enc = tok(args.prompt, return_tensors="pt")
+    enc = tok(args.prompt, return_tensors="pt", add_special_tokens=False)
     tokens = enc["input_ids"].to(device)
     mask = enc.get("attention_mask", None)
     if mask is not None: mask = mask.to(device)
+
+    # Sanity: head dimension must match vocab_size
+    with torch.no_grad():
+        t_short = tokens[:, -min(tokens.size(1), cfg_m.W):]
+        m_short = None if mask is None else mask[:, -t_short.size(1):]
+        head_test = _unwrap_logits(model.forward_tokens(t_short, m_short))
+    V = int(head_test.size(-1))
+    if V != int(cfg_m.vocab_size):
+        raise SystemExit(f"[error] head dim V={V} != cfg.vocab_size={int(cfg_m.vocab_size)}. "
+                         f"Check tokenizer/ckpt/config alignment.")
 
     cfg_s = StreamerConfig(
         W=cfg_m.W, O=cfg_m.O,
