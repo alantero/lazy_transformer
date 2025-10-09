@@ -12,6 +12,7 @@ import logging
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # ------------------------------ safe imports ----------------------------------
 # When executed as a script (python train/loop.py), make repo root importable.
@@ -325,6 +326,7 @@ class ContinuousLM(nn.Module):
     def forward_tokens(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         tokens: [B,T] → logits: [B,T,V], y_win_bnwd: [B, n_win, W, D] (optional), logits_win: [B, n_win, W, V] (optional)
+        Consumes already-shifted inputs if the caller provides them (i.e., expects tokens and mask as given).
         """
         h0 = self.embed(tokens)                             # [B,T,D]
         # Per-window processing
@@ -375,34 +377,78 @@ class ContinuousLM(nn.Module):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        batch = { 'tokens': Long[B,T], optional 'mask': Bool[B,T], optional 'targets': Long[B,T] }
-        Computes next-token CE on the FULL sequence (global shift), not per-window.
+        Training/eval step.
+
+        Preferred (canonical) path:
+          batch = {'x': Long[B,T], 'y': Long[B,T], 'mask': Bool[B,T]}
+          where x is the input sequence, y is next-token targets (shifted by +1),
+          and mask marks valid positions (all ones for fixed windows).
+
+        Backward-compatibility path:
+          batch = {'tokens': Long[B,T], optional 'mask': Bool[B,T], optional 'targets': Long[B,T]}
+          In this case we perform the global next-token shift inside this method.
         """
-        tokens: torch.Tensor = batch["tokens"]
-        mask: Optional[torch.Tensor] = batch.get("mask", None)
-        targets: Optional[torch.Tensor] = batch.get("targets", None)
+        pad_id = int(self.cfg.pad_id)
 
-        logits, y_win, logits_win = self.forward_tokens(tokens, mask)
+        # Detect canonical vs legacy batch format
+        if ("x" in batch) and ("y" in batch):
+            x: torch.Tensor = batch["x"]
+            y: torch.Tensor = batch["y"]
+            mask: Optional[torch.Tensor] = batch.get("mask", None)
 
-        if targets is None:
-            targets = tokens  # teacher forcing: predict next of the input sequence
+            logits, y_win, logits_win = self.forward_tokens(x, mask)  # [B,T,V]
+            B, T, V = logits.shape
+            assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
 
-        # Next-token shift (global)
-        logits_s, targets_s, mask_s = shift_for_next_token(logits, targets, mask=mask)
+            loss = F.cross_entropy(
+                logits.reshape(-1, V),
+                y.reshape(-1),
+                ignore_index=pad_id,
+                reduction="mean",
+            )
 
-        loss, stats = sequence_cross_entropy(
-            logits_s, targets_s, mask=mask_s, ignore_index=self.cfg.pad_id,
-            label_smoothing=0.0, reduction="mean"
-        )
+            with torch.no_grad():
+                pred = logits.argmax(dim=-1)
+                acc = (pred == y).float().mean().item()
 
-        # Bits-per-token (for ledger/rate): use NLL path
-        bpp_tensor, _st_bpp = bits_per_token(
-            logits_s, targets=targets_s, mask=mask_s, use_entropy=False, ignore_index=self.cfg.pad_id
-        )
-        bpp_val = float(bpp_tensor.detach().item())
-        stats["bpp"] = bpp_val
+            # Bits-per-token via helper (NLL path); aligned with y/mask
+            bpp_tensor, _ = bits_per_token(logits, targets=y, mask=mask, use_entropy=False, ignore_index=pad_id)
+            bpp_val = float(bpp_tensor.detach().item())
 
-        # Optional stitching loss on overlaps
+            stats: Dict[str, float] = {"acc": acc, "bpp": bpp_val, "tokens": float(B * T)}
+
+        else:
+            # Legacy path: accept 'tokens' and perform shift inside
+            tokens: torch.Tensor = batch["tokens"]
+            mask: Optional[torch.Tensor] = batch.get("mask", None)
+            targets: Optional[torch.Tensor] = batch.get("targets", None)
+
+            logits, y_win, logits_win = self.forward_tokens(tokens, mask)
+            if targets is None:
+                targets = tokens  # teacher forcing baseline
+
+            # Global next-token shift
+            logits_s, targets_s, mask_s = shift_for_next_token(logits, targets, mask=mask)
+            B, T, V = logits_s.shape
+            assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
+
+            loss = F.cross_entropy(
+                logits_s.reshape(-1, V),
+                targets_s.reshape(-1),
+                ignore_index=pad_id,
+                reduction="mean",
+            )
+
+            with torch.no_grad():
+                pred = logits_s.argmax(dim=-1)
+                acc = (pred == targets_s).float().mean().item()
+
+            bpp_tensor, _ = bits_per_token(logits_s, targets=targets_s, mask=mask_s, use_entropy=False, ignore_index=pad_id)
+            bpp_val = float(bpp_tensor.detach().item())
+
+            stats = {"acc": acc, "bpp": bpp_val, "tokens": float(B * T)}
+
+        # Optional stitching loss on overlaps (unchanged)
         if self.stitch is not None and (self.cfg.O > 0):
             st_loss_terms = []
             st_stats: Dict[str, float] = {}
@@ -428,16 +474,13 @@ class ContinuousLM(nn.Module):
                 stats.update({"loss_stitch": float(st_total.detach().item()), "stitch_w": float(self.cfg.stitch_w)})
                 stats.update(st_stats)
 
-        # Dual penalty in log-space with variance-aware normalization
-        if self.sda is not None:
+        # Dual penalty in log-space with variance-aware normalization (unchanged)
+        if self.sda is not None and ("bpp" in stats):
             with torch.no_grad():
-                metric = math.log(max(bpp_val, 1e-8)) if self._dual_use_log else bpp_val
-                # EMA mean/var on the working domain
+                metric = math.log(max(stats["bpp"], 1e-8)) if self._dual_use_log else float(stats["bpp"])
                 alpha = float(self.cfg.dual_ema)
                 m = float(self._logbpp_mean.item())
-                # Update mean first
                 m_new = alpha * m + (1.0 - alpha) * metric
-                # Update variance as EMA of squared deviation around the updated mean
                 v = float(self._logbpp_var.item())
                 v_new = alpha * v + (1.0 - alpha) * (metric - m_new) ** 2
                 self._logbpp_mean.fill_(m_new)

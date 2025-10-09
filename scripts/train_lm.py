@@ -26,6 +26,22 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+# ---- Performance knobs (safe defaults) ----
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # If PyTorch & GPU support it, prefer high matmul precision (enables TF32 on Ampere+)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+import json
+from contextlib import nullcontext
+
+
+# tqdm for progress bars
+from tqdm.auto import tqdm
 
 # --- Project imports (robust fallbacks where possible) ------------------------
 try:
@@ -139,7 +155,7 @@ class NpyPackedDataset(Dataset):
         return int(self.arr.shape[0])
 
     def __getitem__(self, idx: int):
-        x = np.asarray(self.arr[idx], dtype=np.int32)  # 1D [S]
+        x = np.asarray(self.arr[idx], dtype=np.int32).copy()  # make writable to avoid PyTorch warning
         return torch.as_tensor(x, dtype=torch.long)
 
 def _infer_or_check_seq_len_from_npy(cfg, train_path: str) -> int:
@@ -155,13 +171,13 @@ def _infer_or_check_seq_len_from_npy(cfg, train_path: str) -> int:
     return have
 
 def _npy_collate(seq_len: int):
-    """Stack to [B,S] then shift to tokens/targets; add trivial mask of ones."""
+    """Stack to [B,S] then shift to x/y (next-token) and add a full-ones mask."""
     def _fn(batch):
-        x = torch.stack(batch, dim=0)               # [B, S]
-        tokens  = x[:, :seq_len-1]                   # [B, S-1]
-        targets = x[:, 1:seq_len]                    # [B, S-1]
-        mask    = torch.ones_like(tokens, dtype=torch.bool)
-        return {"tokens": tokens, "targets": targets, "mask": mask}
+        x_full = torch.stack(batch, dim=0)          # [B, S]
+        x = x_full[:, :seq_len-1].contiguous()      # [B, S-1]
+        y = x_full[:, 1:seq_len].contiguous()       # [B, S-1]
+        mask = torch.ones_like(x, dtype=torch.bool) # fixed windows, no pad
+        return {"x": x, "y": y, "mask": mask}
     return _fn
 
 def build_npy_dataloaders(
@@ -195,16 +211,212 @@ def build_npy_dataloaders(
         val_sampler = None
         shuffle_train = True
 
+    pw = bool(num_workers > 0)
+    pf = 4 if num_workers > 0 else None
     train_loader = DataLoader(
         train_ds, batch_size=micro_batch_size, shuffle=shuffle_train, sampler=train_sampler,
-        num_workers=num_workers, pin_memory=pin_memory, drop_last=drop_last, collate_fn=collate
+        num_workers=num_workers, pin_memory=pin_memory, drop_last=drop_last, collate_fn=collate,
+        persistent_workers=pw, prefetch_factor=(pf if pf is not None else 2)
     )
     val_loader = DataLoader(
         val_ds, batch_size=micro_batch_size, shuffle=False, sampler=val_sampler,
-        num_workers=num_workers, pin_memory=pin_memory, drop_last=False, collate_fn=collate
+        num_workers=num_workers, pin_memory=pin_memory, drop_last=False, collate_fn=collate,
+        persistent_workers=pw, prefetch_factor=(pf if pf is not None else 2)
     )
-    logging.info(f"[data] train {tuple(train_ds.arr.shape)}  val {tuple(val_ds.arr.shape)}  seq_len={seq_len}")
+    logging.info(f"[data] train {tuple(train_ds.arr.shape)}  val {tuple(val_ds.arr.shape)}  seq_len={seq_len} | workers={num_workers} persistent={pw} prefetch={pf or 'default'}")
     return train_loader, val_loader, seq_len
+
+
+# --- Helper: Fix vocab/pad from meta.json or NPY probe ---
+def _maybe_fix_vocab_from_meta(cfg, train_path: str) -> None:
+    """
+    Ensure cfg.vocab_size and cfg.pad_id are consistent with the dataset/tokenizer.
+    Preference order:
+      1) meta.json next to the NPY files (written by fwe_tokenize_pack.py)
+      2) quick probe of the NPY memmap to estimate max token id
+    Always enforce: vocab_size >= pad_id+1 and > max_id seen in a small probe.
+    """
+    # Defaults from cfg (may be None)
+    cur_vocab = int(getattr(cfg, "vocab_size", 0) or 0)
+    cur_pad   = getattr(cfg, "pad_id", None)
+
+    # --- Try meta.json ---
+    meta_vocab_candidates: List[int] = []
+    meta_pad: Optional[int] = None
+    try:
+        base = os.path.dirname(os.path.abspath(train_path))
+        meta_path = os.path.join(base, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            # candidates for vocab_size
+            for key in ("vocab_size_hf", "vocab_size"):
+                if key in meta and isinstance(meta[key], (int, float, str)):
+                    try:
+                        meta_vocab_candidates.append(int(meta[key]))
+                    except Exception:
+                        pass
+            # try to infer from eos/pad too
+            for key in ("eos_id", "pad_id"):
+                if key in meta and isinstance(meta[key], (int, float, str)):
+                    try:
+                        meta_vocab_candidates.append(int(meta[key]) + 1)
+                    except Exception:
+                        pass
+            # pad_id preference: meta.pad_id else meta.eos_id
+            if "pad_id" in meta:
+                meta_pad = int(meta["pad_id"])
+            elif "eos_id" in meta:
+                meta_pad = int(meta["eos_id"])
+
+            if meta_vocab_candidates:
+                v_meta = max(meta_vocab_candidates)
+                if cur_vocab != v_meta:
+                    logging.info(f"[data] meta.json suggests vocab_size={v_meta} (candidates={meta_vocab_candidates}); cfg.vocab_size was {cur_vocab}")
+                cur_vocab = max(cur_vocab, v_meta)
+            if meta_pad is not None:
+                cur_pad = meta_pad
+                logging.info(f"[data] meta.json sets pad_id={cur_pad}")
+    except Exception as e:
+        logging.warning(f"[data] failed to read meta.json for vocab/pad fix: {e}")
+
+    # --- Probe small slice of NPY anyway (robustness) ---
+    try:
+        arr = np.load(train_path, mmap_mode="r")
+        vmax = int(np.max(arr[: min(4096, arr.shape[0])]))  # small probe
+        need = vmax + 1
+        if cur_vocab < need:
+            logging.info(f"[data] probe raises vocab_size to {need} (max token id={vmax})")
+        cur_vocab = max(cur_vocab, need)
+    except Exception as e:
+        logging.warning(f"[data] vocab probe failed: {e}")
+
+    # --- Finalize: ensure vocab_size > pad_id and pad defined ---
+    if cur_pad is None:
+        # If pad is still unknown, default to eos-style (last id)
+        cur_pad = max(0, cur_vocab - 1)
+        logging.info(f"[data] pad_id not provided; defaulting to {cur_pad}")
+    if cur_vocab <= int(cur_pad):
+        fixed = int(cur_pad) + 1
+        logging.warning(f"[data] vocab_size {cur_vocab} <= pad_id {cur_pad}; bumping vocab_size -> {fixed}")
+        cur_vocab = fixed
+
+    # Write back to cfg
+    cfg.vocab_size = int(cur_vocab)
+    cfg.pad_id = int(cur_pad)
+    logging.info(f"[data] resolved vocab/pad: vocab_size={cfg.vocab_size}, pad_id={cfg.pad_id}")
+
+# ------------------------------ Sanity checks --------------------------------
+@torch.no_grad()
+def run_sanity_checks(model: torch.nn.Module, batch: Dict[str, torch.Tensor], cfg) -> None:
+    """Log basic alignment and loss sanity metrics on a single batch.
+    Enhanced: Checks vocab head size, target id ranges, and computes CE with/without pad ignore.
+    Also compares model training-style loss to raw CE and off-by-one diagnosis.
+    """
+    import math
+    device = next(model.parameters()).device
+    tokens  = batch["tokens"].to(device)
+    targets = batch["targets"].to(device)
+    mask    = batch.get("mask", None)
+    if mask is not None:
+        mask = mask.to(device)
+
+    eq_ratio = (tokens == targets).float().mean().item()
+    pad_id = getattr(cfg, "pad_id", None)
+    if pad_id is not None:
+        pad_ratio = (targets == int(pad_id)).float().mean().item()
+    else:
+        pad_ratio = 0.0
+
+    uniq = int(torch.unique(targets).numel())
+
+    # --- Forward pass (no grad) on tokens/mask to get logits and the model-aligned labels ---
+    out = model.forward_tokens(tokens, mask)
+    # Unpack logits and optionally a candidate label window
+    if isinstance(out, (tuple, list)) and len(out) >= 1:
+        logits = out[0]
+        candidate = out[1] if len(out) >= 2 else None
+    else:
+        logits = out
+        candidate = None
+
+    B, T, V = logits.shape
+    flat_logits = logits.reshape(B*T, V)
+    flat_targets = targets.reshape(B*T)
+
+    # Decide aligned_y safely: must be Long dtype, 2D [B,T], and match shape
+    aligned_y = None
+    if candidate is not None:
+        try:
+            if isinstance(candidate, torch.Tensor) and candidate.dtype in (torch.long, torch.int64):
+                if candidate.dim() == 2 and candidate.shape[0] == B and candidate.shape[1] == T:
+                    aligned_y = candidate
+        except Exception:
+            aligned_y = None
+    if aligned_y is None:
+        aligned_y = targets  # fallback
+
+    # Aligned CE using the chosen labels
+    ce_aligned = torch.nn.CrossEntropyLoss()(flat_logits, aligned_y.reshape(B*T)).item()
+
+    # Compute CE without ignore_index (raw) and with ignore_index if pad_id is defined (for diagnostics)
+    ce_raw = torch.nn.CrossEntropyLoss()(flat_logits, flat_targets).item()
+    if pad_id is not None:
+        ce_ignore = torch.nn.CrossEntropyLoss(ignore_index=int(pad_id))(flat_logits, flat_targets).item()
+    else:
+        ce_ignore = ce_raw
+
+    # Also try CE if targets were mistakenly unshifted (i.e., equal to tokens) to detect off-by-one
+    ce_vs_tokens = torch.nn.CrossEntropyLoss()(flat_logits, tokens.reshape(B*T)).item()
+
+    # Range checks for targets vs head dimension
+    tmin = int(targets.min().item())
+    tmax = int(targets.max().item())
+    vocab_size = int(getattr(cfg, "vocab_size", V))
+
+    # Try computing the model's own training-style loss on this batch
+    # (ContinuousLM.__call__ returns (loss, stats) with its internal convention)
+    batch_eval = {"tokens": tokens, "targets": targets}
+    if mask is not None:
+        batch_eval["mask"] = mask
+    try:
+        model_loss, model_stats = model(batch_eval)  # type: ignore
+        model_loss = float(model_loss.item()) if hasattr(model_loss, "item") else float(model_loss)
+    except Exception as e:
+        model_loss = float("nan")
+        logging.warning(f"[sanity] could not compute model(batch) loss: {e}")
+        model_stats = {}
+
+    logging.info(
+        "[sanity] eq_ratio(tokens==targets)=%0.4f | pad_ratio(targets==pad_id[%s])=%0.4f | "
+        "unique_targets=%d | head_dim(V)=%d | cfg.vocab_size=%d | targets_range=[%d,%d] | "
+        "CE_aligned=%0.3f | CE_raw=%0.3f | CE_ignore_pad=%0.3f | CE_vs_tokens=%0.3f | model_loss=%s"
+        % (eq_ratio, str(pad_id), pad_ratio, uniq, V, vocab_size, tmin, tmax, ce_aligned, ce_raw, ce_ignore, ce_vs_tokens, f"{model_loss:.3f}" if math.isfinite(model_loss) else "nan")
+    )
+
+    # Heuristics to warn loudly if something is off
+    if eq_ratio > 0.05:
+        logging.warning("[sanity] High eq_ratio indicates shift may be broken (tokens likely equal to targets).")
+    if pad_id is not None and pad_ratio > 0.01:
+        logging.warning("[sanity] Non-negligible pad_id in targets; consider ignoring pad in loss and fixing packing.")
+    if V != vocab_size:
+        logging.warning(f"[sanity] Vocab head dim (V={V}) != cfg.vocab_size ({vocab_size}). Check final projection / tie_softmax.")
+    if tmin < 0 or tmax >= V:
+        logging.warning(f"[sanity] Target IDs out of range for head: min={tmin} max={tmax} vs V={V}.")
+
+    # Alignment checks
+    #if math.isfinite(model_loss) and abs(ce_aligned - model_loss) < 0.5:
+    #    pass  # aligned labels match training loss (good)
+    #else:
+    #    logging.warning("[sanity] CE_aligned diverges from model_loss. Check that forward_tokens returns (logits, y_win) and that collate shift matches training.")
+    # Alignment note: model_loss is authoritative (may include internal masking/normalization).
+    # We log CE_* just for diagnostics; we don't expect it to match model_loss numerically.
+
+    # Detect off-by-one: if CE_vs_tokens << CE_raw but CE_aligned ≈ model_loss
+    if math.isfinite(model_loss) and (ce_vs_tokens + 0.5 < ce_raw) and (abs(ce_aligned - model_loss) < 0.5):
+        logging.warning("[sanity] CE_vs_tokens << CE_raw while CE_aligned ≈ model_loss. Likely your sanity 'targets' are pre-shifted, while the model computes its own shift.")
+
+
 
 
 # ------------------------------ CLI / Main ------------------------------------
@@ -264,7 +476,81 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Micro batch size per step when using NPY dataset.")
     p.add_argument("--num-workers", dest="num_workers", type=int, default=4,
                    help="DataLoader workers for NPY dataset.")
+    p.add_argument("--best-every", dest="best_every", type=int, default=1,
+                   help="Check/save 'best' checkpoint every N steps (default: 1 = every step).")
+    p.add_argument("--val-every", dest="val_every", type=int, default=0,
+                   help="Run validation every N steps (0 disables periodic validation). Best checkpoint is selected by val_loss when validation runs.")
+    p.add_argument("--debug-sanity", action="store_true",
+               help="Run one-time sanity checks on targets/tokens alignment and pad usage before training.")
     return p
+@torch.no_grad()
+def evaluate_val_ce(model: torch.nn.Module, val_loader: DataLoader, pad_id: int) -> Dict[str, float]:
+    """Evaluate cross-entropy/accuracy on the validation loader.
+
+    Notes:
+      - We DO NOT assume `model.device` exists (ContinuousLM doesn't expose it).
+        Instead we get the device from the first parameter.
+      - Uses ignore_index=pad_id to be robust to occasional EOS-as-pad in packed windows.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    total_loss, total_tok, total_acc = 0.0, 0, 0.0
+    for batch in val_loader:
+        x = batch["x"].to(device, non_blocking=True)
+        y = batch["y"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True)
+        out = model.forward_tokens(x, mask)      # may be Tensor or (logits, ...)
+        if isinstance(out, (tuple, list)):
+            logits = out[0]
+        else:
+            logits = out
+        B, T, V = logits.shape
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, V), y.reshape(-1),
+            ignore_index=int(pad_id),
+            reduction="sum",
+        )
+        total_loss += float(loss.item())
+        total_tok  += int(B * T)
+        total_acc  += float((logits.argmax(-1) == y).float().mean().item())
+    mean_loss = total_loss / max(total_tok, 1)
+    ppl = math.exp(mean_loss)
+    acc = total_acc / max(1, len(val_loader))
+    return {"val_loss": mean_loss, "val_ppl": ppl, "val_acc": acc}
+
+# --- tqdm-enabled validation function ---
+@torch.no_grad()
+def evaluate_val_ce_tqdm(model: torch.nn.Module, val_loader: DataLoader, pad_id: int, desc: str) -> Dict[str, float]:
+    """Same as evaluate_val_ce, but displays a tqdm over the validation loader."""
+    model.eval()
+    device = next(model.parameters()).device
+    total_loss, total_tok, total_acc = 0.0, 0, 0.0
+    with tqdm(val_loader, desc=desc, leave=False, dynamic_ncols=True) as pbar:
+        for batch in pbar:
+            x = batch["x"].to(device, non_blocking=True)
+            y = batch["y"].to(device, non_blocking=True)
+            mask = batch["mask"].to(device, non_blocking=True)
+            out = model.forward_tokens(x, mask)
+            logits = out[0] if isinstance(out, (tuple, list)) else out
+            B, T, V = logits.shape
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, V), y.reshape(-1),
+                ignore_index=int(pad_id),
+                reduction="sum",
+            )
+            total_loss += float(loss.item())
+            total_tok  += int(B * T)
+            batch_acc = float((logits.argmax(-1) == y).float().mean().item())
+            total_acc  += batch_acc
+            # live metrics
+            mean_loss = total_loss / max(total_tok, 1)
+            ppl = math.exp(mean_loss)
+            mean_acc = total_acc / max(1, pbar.n + 1)
+            pbar.set_postfix({"loss": f"{mean_loss:.4f}", "ppl": f"{ppl:.1f}", "acc": f"{mean_acc:.3f}"})
+    mean_loss = total_loss / max(total_tok, 1)
+    ppl = math.exp(mean_loss)
+    acc = total_acc / max(1, len(val_loader))
+    return {"val_loss": mean_loss, "val_ppl": ppl, "val_acc": acc}
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = build_argparser().parse_args(argv)
@@ -313,16 +599,48 @@ def main(argv: Optional[List[str]] = None) -> None:
         "profile": args.profile, "profile_nvtx": args.profile_nvtx, "profile_log_mem": args.profile_log_mem,
     }
     # HF config merge (preset -> HF -> CLI). YAML is optional and not used here.
+    #hf_dict = {}
+    #if args.hf_config is not None and load_hf_config is not None:
+    #    try:
+    #        cfg_hf = load_hf_config(args.hf_config)
+    #        hf_dict = asdict(cfg_hf)
+    #    except Exception as e:
+    #        logging.warning(f"[hf] failed to load HF config: {e}")
+
+    #merged = merge_cfg(preset_dict, hf_dict)
+    #merged = merge_cfg(merged, overrides)
+
+
     hf_dict = {}
-    if args.hf_config is not None and load_hf_config is not None:
-        try:
-            cfg_hf = load_hf_config(args.hf_config)
-            hf_dict = asdict(cfg_hf)
-        except Exception as e:
-            logging.warning(f"[hf] failed to load HF config: {e}")
+    if args.hf_config is not None:
+        if load_hf_config is not None:
+            try:
+                cfg_hf = load_hf_config(args.hf_config)
+                hf_dict = asdict(cfg_hf)
+            except Exception as e:
+                logging.warning(f"[hf] failed to load HF config with utils.hf_config: {e}")
+        if not hf_dict:
+            # Fallback: JSON plano (archivo directo o carpeta con config.json)
+            cfg_path = args.hf_config
+            if os.path.isdir(cfg_path):
+                cfg_path = os.path.join(cfg_path, "config.json")
+            try:
+                with open(cfg_path, "r") as f:
+                    hf_dict = json.load(f)
+                logging.info(f"[hf] loaded plain JSON config from {cfg_path}")
+            except Exception as e:
+                logging.warning(f"[hf] failed to load plain JSON config: {e}")
 
     merged = merge_cfg(preset_dict, hf_dict)
     merged = merge_cfg(merged, overrides)
+
+    # Ensure compatibility: LoopConfig has no 'max_len' field.
+    # If pos_kind='learned', fall back to sinusoidal to avoid requiring max_len in TokenEmbedder.
+    if merged.get("pos_kind") == "learned":
+        logging.warning("[cfg] pos_kind='learned' requested but LoopConfig has no 'max_len'; falling back to pos_kind='sinusoidal'.")
+        merged["pos_kind"] = "sinusoidal"
+
+
 
     cfg = LoopConfig(**merged)  # type: ignore[arg-type]
 
@@ -344,6 +662,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             pin_memory=True,
             drop_last=True,
         )
+        # Fix vocab_size/pad_id from meta.json or probe
+        _maybe_fix_vocab_from_meta(cfg, args.train_npy)
+        # Defensive assertion
+        assert 0 <= int(cfg.pad_id) < int(cfg.vocab_size), f"pad_id {cfg.pad_id} must be within [0, vocab_size={cfg.vocab_size})"
         device = torch.device(cfg.device)
         model = ContinuousLM(cfg).to(device)
         opt = build_optimizer(model, cfg)
@@ -392,20 +714,84 @@ def main(argv: Optional[List[str]] = None) -> None:
             best_tag=cfg.best_metric_name,
             is_better=(lambda new, best: (best is None) or (new < best)),
         )
+        # --- Step tracking for resume ---
+        start_step = 0
         if cfg.resume_path:
             try:
                 from train.checkpoints import load_checkpoint  # type: ignore
                 ckpt = load_checkpoint(cfg.resume_path, model=model, optimizer=opt, scheduler=None, strict_model=False)
                 logging.info(f"[ckpt] resumed from {cfg.resume_path} (step={ckpt.get('step')}, epoch={ckpt.get('epoch')})")
+                start_step = int(ckpt.get("step", 0) or 0)
+                logging.info(f"[ckpt] resume start_step={start_step}")
             except Exception as e:
                 logging.warning(f"[ckpt] resume failed: {e}")
+        try:
+            if sch is not None and start_step > 0:
+                # Advance scheduler state to match resumed step (best-effort).
+                sch.step(start_step - 1, metrics=None)
+        except Exception as e:
+            logging.warning(f"[sched] failed to advance scheduler to step {start_step-1}: {e}")
 
         tm = ThroughputMeter() if ThroughputMeter is not None else None
         device_ctx = torch.cuda.amp.autocast if (cfg.device == "cuda" and hasattr(torch.cuda, "amp")) else nullcontext  # type: ignore
 
+        # ---- AMP setup (autocast, GradScaler) ----
+        use_amp = (cfg.device == "cuda" and torch.cuda.is_available())
+        try:
+            from torch import amp as _amp
+        except Exception:
+            class _Noop:
+                def __init__(self, *a, **k): pass
+                def __call__(self, *a, **k):
+                    from contextlib import nullcontext
+                    return nullcontext()
+                def scale(self, x): return x
+                def step(self, opt): opt.step()
+                def update(self): pass
+            autocast = _Noop()
+            class GradScaler(_Noop): pass
+        else:
+            autocast = _amp.autocast
+            GradScaler = _amp.GradScaler
+        scaler = GradScaler("cuda", enabled=use_amp)
+
+
+
+        # Optional one-time sanity checks on validation batch
+        if args.debug_sanity:
+            try:
+                sample_batch = next(iter(val_loader))
+            except StopIteration:
+                sample_batch = next(iter(train_loader))
+            # Build a legacy-style view for sanity (tokens/targets) from x/y
+            legacy = {
+                "tokens": sample_batch["x"].to(device, non_blocking=True),
+                "targets": sample_batch["y"].to(device, non_blocking=True),
+                "mask": sample_batch["mask"].to(device, non_blocking=True),
+            }
+            model.eval()
+            run_sanity_checks(model, legacy, cfg)
+            model.train()
+
+
+
         # --- Train loop over DataLoader ---------------------------------------
+        def _train_step_ce(model, opt, batch):
+            model.train()
+            opt.zero_grad(set_to_none=True)
+            with autocast("cuda", enabled=use_amp):
+                loss, stats = model(batch)  # ContinuousLM returns (loss, stats)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            stats = dict(stats)
+            stats["loss"] = float(loss.item())
+            return stats
+
         train_iter = iter(train_loader)
-        for s in range(steps):
+        pbar = tqdm(range(start_step, steps), initial=start_step, total=steps, desc="training", dynamic_ncols=True)
+        for s in pbar:
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -413,47 +799,61 @@ def main(argv: Optional[List[str]] = None) -> None:
                 batch = next(train_iter)
 
             # Move to device
-            for k in ("tokens", "targets", "mask"):
-                if k in batch:
-                    batch[k] = batch[k].to(device, non_blocking=True)
+            for k in ("x", "y", "mask"):
+                batch[k] = batch[k].to(device, non_blocking=True)
 
             if cfg.profile and Timer is not None:
                 timer = Timer(sync_cuda=True)
                 with (nvtx_range(f"step_{s}") if args.profile_nvtx else torch.autograd.profiler.record_function("train_step")):
                     timer.start()
-                    stats = train_step(model, batch, opt)
+                    stats = _train_step_ce(model, opt, batch)
                     dt = timer.stop()
                 if tm is not None:
                     tok = int(stats.get("tokens", 0))
                     if tok > 0:
                         tm.update(tok, dt)
             else:
-                stats = train_step(model, batch, opt)
+                stats = _train_step_ce(model, opt, batch)
 
             last_batch = batch  # keep last for sanity forward
 
-            # Logs
-            if (s % max(1, int(args.log_interval))) == 0 or s == steps - 1:
-                lr = opt.param_groups[0]["lr"]
-                msg = f"step {s}/{steps} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} | bpp={stats.get('bpp', 0.0):.3f} | lr={lr:.2e}"
-                if cfg.profile and tm is not None and tm.time_s > 0:
-                    msg += f" | ips={tm.ips:.1f}"
-                if cfg.profile_log_mem and torch.cuda.is_available():
-                    m = gpu_mem()
-                    msg += f" | gpuMB={m['allocated']:.1f}/{m['reserved']:.1f}"
-                logging.info(msg)
+            # tqdm live metrics (updates every step)
+            lr = opt.param_groups[0]["lr"]
+            postfix = {
+                "loss": f"{stats['loss']:.4f}",
+                "acc": f"{stats.get('acc', 0.0):.3f}",
+                "bpp": f"{stats.get('bpp', 0.0):.3f}",
+                "lr": f"{lr:.2e}",
+            }
+            if cfg.profile and tm is not None and tm.time_s > 0:
+                postfix["ips"] = f"{tm.ips:.1f}"
+            pbar.set_postfix(postfix)
 
             # Checkpoints
             ckpt_mgr.periodic_save(
                 model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
                 every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
             )
-            metric_name = cfg.best_metric_name
-            metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
-            ckpt_mgr.update_best(
-                metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
-                step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
-            )
+            ran_val = False
+            if int(args.val_every) > 0 and (s > start_step) and ((s % int(args.val_every)) == 0):
+                # nested tqdm for validation; resumes outer pbar after it finishes
+                val_metrics = evaluate_val_ce_tqdm(model, val_loader, pad_id=int(cfg.pad_id), desc=f"val @ step {s}")
+                logging.info(f"[val] step {s} | val_loss={val_metrics['val_loss']:.4f} | val_ppl={val_metrics['val_ppl']:.3f} | val_acc={val_metrics['val_acc']:.3f}")
+                metric_name = "val_loss"
+                metric_val = float(val_metrics["val_loss"])
+                ckpt_mgr.update_best(
+                    metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
+                    step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+                )
+                ran_val = True
+            if not ran_val:
+                metric_name = cfg.best_metric_name
+                metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
+                if int(args.best_every) <= 1 or (s % int(args.best_every) == 0):
+                    ckpt_mgr.update_best(
+                        metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
+                        step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+                    )
 
             if sch is not None:
                 sch.step(s, metrics=float(stats.get("loss", 0.0)))
@@ -462,7 +862,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         model.eval()
         with torch.no_grad():
             ref = last_batch if last_batch is not None else next(iter(val_loader))
-            logits, *_ = model.forward_tokens(ref["tokens"], ref.get("mask", None))
+            logits = model.forward_tokens(ref["x"], ref.get("mask", None))
             B, T, V = logits.shape
             print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
 
@@ -479,6 +879,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         texts = load_texts(args.text_file)
         vocab = SimpleVocab.build_from_texts(texts, mode="char", add_unk=False)
         batch, _ = build_batch_from_texts(texts, vocab, cfg.W, cfg.O)
+        # Defensive: ensure pad_id and vocab_size are set before model creation
+        if getattr(cfg, "pad_id", None) is None:
+            cfg.pad_id = 0
+        if getattr(cfg, "vocab_size", None) is None:
+            cfg.vocab_size = int(vocab.size if 'vocab' in locals() else 128)
+        assert 0 <= int(cfg.pad_id) < int(cfg.vocab_size), f"pad_id {cfg.pad_id} must be within [0, vocab_size={cfg.vocab_size})"
 
     # --- Model / Optim / Scheduler / Ckpt (text fallback) --------------------
     device = torch.device(cfg.device)
@@ -486,6 +892,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     for k in list(batch.keys()):
         batch[k] = batch[k].to(device)
     opt = build_optimizer(model, cfg)
+
+
+    if args.debug_sanity:
+        model.eval()
+        run_sanity_checks(model, batch, cfg)
+        model.train()
+
 
     sch = None
     if cfg.scheduler_name:
@@ -533,19 +946,27 @@ def main(argv: Optional[List[str]] = None) -> None:
         best_tag=cfg.best_metric_name,
         is_better=(lambda new, best: (best is None) or (new < best)),
     )
-
-    # Resume (optional) — mirror NPY branch behavior
+    # --- Step tracking for resume ---
+    start_step = 0
     if cfg.resume_path:
         try:
             from train.checkpoints import load_checkpoint  # type: ignore
             ckpt = load_checkpoint(cfg.resume_path, model=model, optimizer=opt, scheduler=None, strict_model=False)
             logging.info(f"[ckpt] resumed from {cfg.resume_path} (step={ckpt.get('step')}, epoch={ckpt.get('epoch')})")
+            start_step = int(ckpt.get("step", 0) or 0)
+            logging.info(f"[ckpt] resume start_step={start_step}")
         except Exception as e:
             logging.warning(f"[ckpt] resume failed: {e}")
+    try:
+        if sch is not None and start_step > 0:
+            sch.step(start_step - 1, metrics=None)
+    except Exception as e:
+        logging.warning(f"[sched] failed to advance scheduler to step {start_step-1}: {e}")
 
     tm = ThroughputMeter() if ThroughputMeter is not None else None
 
-    for s in range(steps):
+    pbar_txt = tqdm(range(start_step, steps), initial=start_step, total=steps, desc="training", dynamic_ncols=True)
+    for s in pbar_txt:
         if cfg.profile and Timer is not None:
             timer = Timer(sync_cuda=True)
             with (nvtx_range(f"step_{s}") if args.profile_nvtx else torch.autograd.profiler.record_function("train_step")):
@@ -559,15 +980,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             stats = train_step(model, batch, opt)
 
-        if (s % max(1, int(args.log_interval))) == 0 or s == steps - 1:
-            lr = opt.param_groups[0]["lr"]
-            msg = f"step {s}/{steps} | loss={stats['loss']:.4f} | acc={stats.get('acc', 0.0):.3f} | bpp={stats.get('bpp', 0.0):.3f} | lr={lr:.2e}"
-            if cfg.profile and tm is not None and tm.time_s > 0:
-                msg += f" | ips={tm.ips:.1f}"
-            if cfg.profile_log_mem and torch.cuda.is_available():
-                m = gpu_mem()
-                msg += f" | gpuMB={m['allocated']:.1f}/{m['reserved']:.1f}"
-            logging.info(msg)
+        lr = opt.param_groups[0]["lr"]
+        postfix = {
+            "loss": f"{stats['loss']:.4f}",
+            "acc": f"{stats.get('acc', 0.0):.3f}",
+            "bpp": f"{stats.get('bpp', 0.0):.3f}",
+            "lr": f"{lr:.2e}",
+        }
+        if cfg.profile and tm is not None and tm.time_s > 0:
+            postfix["ips"] = f"{tm.ips:.1f}"
+        pbar_txt.set_postfix(postfix)
 
         ckpt_mgr.periodic_save(
             model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
@@ -575,17 +997,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         metric_name = cfg.best_metric_name
         metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
-        ckpt_mgr.update_best(
-            metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
-            step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
-        )
+        if int(args.best_every) <= 1 or (s % int(args.best_every) == 0):
+            ckpt_mgr.update_best(
+                metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
+                step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+            )
 
         if sch is not None:
             sch.step(s, metrics=float(stats.get("loss", 0.0)))
 
     model.eval()
     with torch.no_grad():
-        logits, *_ = model.forward_tokens(batch["tokens"], batch.get("mask", None))
+        logits = model.forward_tokens(batch.get("tokens", batch.get("x")), batch.get("mask", None))
         B, T, V = logits.shape
         print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
 

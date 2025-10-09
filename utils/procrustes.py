@@ -76,6 +76,9 @@ def _transpose(a: Any) -> Any:
         return a.transpose(-2, -1)
     return np.swapaxes(a, -2, -1)
 
+
+
+"""
 def _svd(a: Any) -> Tuple[Any, Any, Any]:
     # Returns U, S, Vt (so that a = U @ diag(S) @ Vt)
     if _is_torch(a):
@@ -85,6 +88,41 @@ def _svd(a: Any) -> Tuple[Any, Any, Any]:
     else:
         U, S, Vt = np.linalg.svd(a, full_matrices=False)
         return U, S, Vt
+"""
+
+# utils/procrustes.py
+
+#import torch
+from contextlib import nullcontext
+
+def _svd(a: torch.Tensor, full_matrices: bool = False):
+    """
+    SVD robusta:
+      - Fuerza float32 (half/bfloat16 no siempre están soportados en gesvdj).
+      - Desactiva autocast dentro de la op.
+      - Si CUDA falla, cae a CPU y devuelve en el device original.
+    """
+    in_device = a.device
+    try:
+        # PyTorch ≥ 2.1
+        autocast_ctx = torch.amp.autocast("cuda", enabled=False)
+    except Exception:
+        autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        a32 = a.detach()
+        if a32.dtype not in (torch.float32, torch.float64):
+            a32 = a32.float()
+        try:
+            U, S, Vh = torch.linalg.svd(a32, full_matrices=full_matrices)
+        except RuntimeError:
+            # Fallback CPU
+            U, S, Vh = torch.linalg.svd(a32.cpu(), full_matrices=full_matrices)
+            U = U.to(in_device)
+            S = S.to(in_device)
+            Vh = Vh.to(in_device)
+    return U, S, Vh
+
 
 def _qr(a: Any) -> Tuple[Any, Any]:
     if _is_torch(a):
@@ -199,17 +237,24 @@ def procrustes(
     # That aligns columns (bases/features) via Kabsch in k-dim
     def _kabsch(M):
         # Standard orthogonal Procrustes: M = A^T B = U S V^T, R* = U V^T
-        U, S, Vt = _svd(M)  # U:[k,k], Vt:[k,k]
         if _is_torch(M):
-            R = _matmul(U, Vt)  # since Vt is V^T for real SVD
-            if not allow_reflection:
-                detR = torch.det(R)
-                if detR < 0:
-                    U_adj = U.clone()
-                    U_adj[..., :, -1] *= -1.0
-                    R = _matmul(U_adj, Vt)
+            # run in float32 with autocast disabled to avoid Half CUDA limitations
+            try:
+                _ac = torch.amp.autocast("cuda", enabled=False)
+            except Exception:
+                _ac = nullcontext()
+            with _ac:
+                U, S, Vt = _svd(M)  # returns float32 tensors
+                R = _matmul(U, Vt)  # [k, k]
+                if not allow_reflection:
+                    detR = torch.det(R)
+                    if detR < 0:
+                        U_adj = U.clone()
+                        U_adj[..., :, -1] *= -1.0
+                        R = _matmul(U_adj, Vt)
             return R
         else:
+            U, S, Vt = _svd(M)  # numpy path
             R = _matmul(U, Vt)
             if not allow_reflection:
                 detR = np.linalg.det(R)
@@ -251,7 +296,12 @@ def procrustes(
             R_list.append(Ri)
             A_aligned_list.append(Ai_rot)
             if _is_torch(Ri):
-                det_list.append(torch.det(Ri).unsqueeze(0))
+                try:
+                    _ac = torch.amp.autocast("cuda", enabled=False)
+                except Exception:
+                    _ac = nullcontext()
+                with _ac:
+                    det_list.append(torch.det(Ri.to(torch.float32)).unsqueeze(0))
             else:  # numerical corner (should not occur when torch)
                 det_list.append(torch.tensor(np.linalg.det(Ri)).unsqueeze(0))
             if scale:
