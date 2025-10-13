@@ -70,14 +70,6 @@ def _top_k_top_p_filtering(logits: Tensor, top_k: int = 0, top_p: float = 1.0) -
     return z
 
 
-def _sample_from_logits(logits: Tensor, *, temperature: float, top_k: int, top_p: float) -> Tuple[Tensor, Tensor]:
-    """Sample id from [B,V] logits with T/top-k/top-p. Returns (ids[B], probs[B])."""
-    z = logits / float(max(temperature, 1e-8))
-    zf = _top_k_top_p_filtering(z, top_k=top_k, top_p=top_p)
-    p = F.softmax(zf, dim=-1)
-    ids = torch.multinomial(p, num_samples=1).squeeze(-1)
-    probs = p.gather(dim=-1, index=ids.unsqueeze(-1)).squeeze(-1)
-    return ids, probs
 
 
 def _entropy_last(logits_last: Tensor) -> Tensor:
@@ -314,21 +306,23 @@ class Streamer:
             last = apply_repetition_penalty(last, history_ids, self.cfg.repetition_penalty, window=self.cfg.W + self.cfg.O)
             last = block_repeated_ngrams(last, history_ids, self.cfg.no_repeat_ngram_size, V, window=self.cfg.W + self.cfg.O)
 
-            # Method-specific filtering
-            if self.cfg.method == "typical":
-                z = typical_filtering(last, p=self.cfg.typical_p)
-            elif self.cfg.method == "greedy":
-                z = last
-            else:
-                z = last
-
-            # Min-p then standard nucleus/top-k + temperature
-            z = min_p_filtering(z, min_p=self.cfg.min_p)
+            # Method-specific filtering + sampling pipeline
+            # Order (HF-style): temperature -> typical (optional) -> min-p -> top-k/top-p -> sample/greedy
             if self.cfg.method == "greedy":
+                # Greedy does not use temperature or stochastic filters
+                z = last
                 next_ids = torch.argmax(z, dim=-1)
             else:
-                z = z / float(max(self.cfg.temperature, 1e-8))
+                # 1) Temperature
+                z = last / float(max(self.cfg.temperature, 1e-8))
+                # 2) Typical (optional)
+                if self.cfg.method == "typical":
+                    z = typical_filtering(z, p=self.cfg.typical_p)
+                # 3) Min-p (eta)
+                z = min_p_filtering(z, min_p=self.cfg.min_p)
+                # 4) Top-k / Top-p
                 z = _top_k_top_p_filtering(z, top_k=self.cfg.top_k, top_p=self.cfg.top_p)
+                # 5) Sample
                 p = torch.softmax(z, dim=-1)
                 next_ids = torch.multinomial(p, num_samples=1).squeeze(-1)
             tokens, m = _append_tokens(tokens, m, next_ids)
@@ -406,6 +400,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--min-new-tokens", type=int, default=8)
     parser.add_argument("--no-stop-on-optimum", action="store_true", help="Disable entropy plateau early-stop.")
+    parser.add_argument("--eos-stop", action="store_true", help="Stop when EOS is generated.")
     args = parser.parse_args()
 
     # Ensure repo root is on sys.path when running as a script
@@ -500,7 +495,7 @@ if __name__ == "__main__":
         min_p=args.min_p,
         stop_on_optimum=not args.no_stop_on_optimum, opt_window=8, opt_patience=4, opt_eps=1e-3, min_new_tokens=max(2, args.min_new_tokens),
         teleport_every=None, teleport_on_low_capacity=False, cap_threshold=0.10, keep_collar_on_teleport=True,
-        device=str(device), pad_id=cfg_m.pad_id, eos_id=int(tok.eos_token_id),
+        device=str(device), pad_id=cfg_m.pad_id, eos_id=int(tok.eos_token_id) if args.eos_stop else None,
     )
     streamer = Streamer(model, cfg_s)
     out = streamer.generate(tokens, mask, max_new_tokens=args.max_new_tokens)
