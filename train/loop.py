@@ -5,7 +5,7 @@
 # PyTorch-only. Uses the modules we built in this project.
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Tuple
 
 import logging
@@ -77,7 +77,7 @@ class LoopConfig:
 
     # chebyshev filter
     cheb_deg: int = 8
-    cheb_laplacian: str = "path"  # 'path' (Dirichlet, causal) | 'cycle' (periodic)
+    cheb_laplacian: str = "path_causal"  # 'path_causal' (strictly causal AR), 'path' (Dirichlet, non-causal), 'cycle' (periodic wrap)
 
     # port-hamiltonian
     skew_rank: int = 16
@@ -197,7 +197,8 @@ class ContinuousBlock(nn.Module):
 
         # Chebyshev spectral filter over time axis.
         # IMPORTANT FIX: ChebFilter1D signature does NOT take `d`; use K/groups/laplacian.
-        self.cheb = ChebFilter1D(K=cheb_deg, groups=groups, laplacian=laplacian)
+        lap_mode = laplacian  # expected in {'path_causal','path','cycle'}
+        self.cheb = ChebFilter1D(K=cheb_deg, groups=groups, laplacian=lap_mode)
 
         # Port-Hamiltonian field + integrator
         self.field = PortHamiltonianStep(
@@ -205,7 +206,7 @@ class ContinuousBlock(nn.Module):
         )
         self.integ = Integrator(self.field, method=method, dt=dt, steps=integ_steps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, step_hook=None) -> torch.Tensor:
         """
         x: [B', W, D]
         """
@@ -227,7 +228,7 @@ class ContinuousBlock(nn.Module):
         y = self.cheb(g)  # API computes its own 1D Laplacian per window length and mode
 
         # Integrate Port-Hamiltonian dynamics
-        z = self.integ(y)  # [B', W, D]
+        z = self.integ(y, step_hook=step_hook)  # [B', W, D]
         return z
 
 
@@ -265,7 +266,8 @@ class ContinuousLM(nn.Module):
             use_gauge=cfg.use_gauge,
         )
 
-        # Output head: tie to embedder weights (lazy-friendly)
+        # Canonical naming: the logits projection is `self.head` only.
+        # We do not export `lm_head.*` aliases in state_dict; inference must use `head`.
         self.head = OutputHead(
             vocab_size=None if cfg.tie_softmax else cfg.vocab_size,
             d_model=cfg.d_model,
@@ -338,7 +340,7 @@ class ContinuousLM(nn.Module):
         return yr.permute(0, 2, 1).contiguous()     # [B, T, D]
 
     @torch.no_grad()
-    def _maybe_debug_state(self, h_full: torch.Tensor, logits: torch.Tensor, tokens: Optional[torch.Tensor]) -> None:
+    def _maybe_debug_state(self, h_full: torch.Tensor, logits: torch.Tensor, tokens: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None) -> None:
         if not self._debug_state_norm and not self._debug_align:
             return
         # step gating
@@ -366,89 +368,122 @@ class ContinuousLM(nn.Module):
             mean_all = float(n_all.mean().item())
             std_all = float(n_all.std(unbiased=False).item())
             logging.info(f"[debug] ||h_last|| mean={mean_last:.3f} std={std_last:.3f} | ||h|| mean={mean_all:.3f} std={std_all:.3f}")
+            # Log entropy and logit range at last time-step
+            last_logits = logits[:, -1, :]  # [B, V]
+            logit_range = (last_logits.max() - last_logits.min()).item()
+            p = F.softmax(last_logits, dim=-1)
+            H = -(p * (p.clamp_min(1e-12).log())).sum(-1).mean().item()
+            logging.info(f"[debug] last-step: logit_range={logit_range:.3f} | entropy={H:.3f}")
 
         if self._debug_align:
-            # Build canonical next-token targets from tokens if available, else from argmax teacher
+            # If we have tokens, compute canonical next-token shift diagnostics
             if tokens is not None:
-                # shift: predict tokens[:,1:] from tokens[:, :-1]
-                if tokens.size(1) == logits.size(1):
-                    y = tokens
+                logits_s, targets_s, mask_s = shift_for_next_token(logits, tokens, mask=mask)
+                Bs, Ts, V = logits_s.shape
+                ce_full = F.cross_entropy(logits_s.reshape(-1, V), targets_s.reshape(-1), reduction="mean")
+                if Ts > 1:
+                    ce_left  = F.cross_entropy(logits_s[:, :-1, :].reshape(-1, V), targets_s[:, :-1].reshape(-1), reduction="mean")
+                    ce_right = F.cross_entropy(logits_s[:, 1:,  :].reshape(-1, V), targets_s[:, 1: ].reshape(-1), reduction="mean")
                 else:
-                    # if caller passed already-shifted inputs, fall back to zeros-safe
-                    y = tokens
+                    ce_left = ce_full
+                    ce_right = ce_full
+                acc_full = float((logits_s.argmax(-1) == targets_s).float().mean().item())
+                logging.info(f"[debug] CE(full)={float(ce_full.item()):.4f} | CE(<)={float(ce_left.item()):.4f} | CE(>)={float(ce_right.item()):.4f} | acc_full={acc_full:.3f}")
+
+                if self._debug_topk > 0:
+                    probs = F.softmax(logits_s[0, -1], dim=-1)
+                    topk = min(self._debug_topk, V)
+                    val, idx = torch.topk(probs, k=topk, dim=-1)
+                    logging.info(f"[debug] top{topk}_ids(last@0)={idx.tolist()} | top{topk}_probs={val.tolist()}")
             else:
-                # fallback: use greedy teacher (only for debug)
+                # Fallback: diagnostics vs greedy teacher (not strictly next-token)
                 y = logits.argmax(dim=-1)
+                Bf, Tf, V = logits.shape
+                ce_full = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1), reduction="mean")
+                if Tf > 1:
+                    ce_left  = F.cross_entropy(logits[:, :-1, :].reshape(-1, V), y[:, :-1].reshape(-1), reduction="mean")
+                    ce_right = F.cross_entropy(logits[:, 1:,  :].reshape(-1, V), y[:, 1: ].reshape(-1), reduction="mean")
+                else:
+                    ce_left = ce_full
+                    ce_right = ce_full
+                acc_full = float((logits.argmax(-1) == y).float().mean().item())
+                logging.info(f"[debug] CE(full)={float(ce_full.item()):.4f} | CE(<)={float(ce_left.item()):.4f} | CE(>)={float(ce_right.item()):.4f} | acc_full={acc_full:.3f}")
+                if self._debug_topk > 0:
+                    probs = F.softmax(logits[0, -1], dim=-1)
+                    topk = min(self._debug_topk, V)
+                    val, idx = torch.topk(probs, k=topk, dim=-1)
+                    logging.info(f"[debug] top{topk}_ids(last@0)={idx.tolist()} | top{topk}_probs={val.tolist()}")
 
-            # Three CE variants to catch off-by-one mishaps (no ignore_index here)
-            ce_full = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1), reduction="mean")
-            if T > 1:
-                ce_left = F.cross_entropy(logits[:, :-1, :].reshape(-1, V), y[:, :-1].reshape(-1), reduction="mean")
-                ce_right = F.cross_entropy(logits[:, 1:, :].reshape(-1, V), y[:, 1:].reshape(-1), reduction="mean")
-            else:
-                ce_left = ce_full
-                ce_right = ce_full
-            acc_full = float((logits.argmax(-1) == y).float().mean().item())
-            logging.info(f"[debug] CE(full)={float(ce_full.item()):.4f} | CE(<)={float(ce_left.item()):.4f} | CE(>)={float(ce_right.item()):.4f} | acc_full={acc_full:.3f}")
+        return
 
-            if self._debug_topk > 0:
-                # top-k of last position of sample 0
-                probs = F.softmax(logits[0, -1], dim=-1)
-                topk = min(self._debug_topk, V)
-                val, idx = torch.topk(probs, k=topk, dim=-1)
-                logging.info(f"[debug] top{topk}_ids(last@0)={idx.tolist()} | top{topk}_probs={val.tolist()}")
-
-    def forward_tokens(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def forward_tokens(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
-        tokens: [B,T] → logits: [B,T,V], y_win_bnwd: [B, n_win, W, D], logits_win: [B, n_win, W, V] (optional)
-        Consumes already-shifted inputs if the caller provides them (i.e., expects tokens and mask as given).
+        Canonical forward for LM given batch of token ids and optional mask.
+
+        Args:
+            tokens: LongTensor [B, T]
+            mask: Optional Bool/Byte [B, T]
+
+        Returns:
+            logits: [B, T, V]
+            y_win_bnwd: [B, n_win, W, D]   # hidden by windows
+            logits_win: Optional [B, n_win, W, V]  # logits per window if stitching KL is enabled
         """
-        tokens_for_debug = tokens
-        h0 = self.embed(tokens)                             # [B,T,D]
-        # Per-window processing
+        # 1) Embed tokens -> [B, T, D]
+        h0 = self.embed(tokens)
+
+        # 2) Slice into windows
         xw, B, T, D, nwin = self._shape_windows(h0)
-
         W, O = self.cfg.W, self.cfg.O
         use_border_only = self.training and self.cfg.grads_border_only and (O > 0) and (W > 2 * O)
 
-        if use_border_only:
-            # 1) no-grad full-window pass (bulk cheap)
-            with torch.no_grad():
-                y_ng = self.block(xw)                       # [B*nw, W, D] (detached)
-            # 2) grad pass (recompute) – we will keep only collars from this result
-            y_g = self.block(xw)                            # [B*nw, W, D] (with grads)
+        # Decide whether to log integrator steps
+        want_integ_log = (self._debug_state_norm or self._debug_align)
+        # step gating: log at step 0 and every _debug_align_every steps
+        step_gate = (self._debug_step % self._debug_align_every == 0)
+        want_integ_log = want_integ_log and step_gate
+        if want_integ_log:
+            def integ_hook(info: Dict[str, float]):
+                logging.info(f"[integ] {info}")
+        else:
+            integ_hook = None
 
-            # compose final window outputs: bulk from no-grad, collars from grad
+        if use_border_only:
+            # no-grad bulk
+            with torch.no_grad():
+                y_ng = self.block(xw, step_hook=integ_hook)  # [B*nw, W, D]
+            # grad pass
+            y_g = self.block(xw, step_hook=integ_hook)      # [B*nw, W, D]
+            # compose: bulk from no-grad, collars from grad
             y = y_ng.detach().clone()
             if O > 0:
                 y[:, :O, :] = y_g[:, :O, :]
                 y[:, W - O:, :] = y_g[:, W - O:, :]
 
-            # optional refresh by drift: compare mean of bulk vs collars
+            # optional refresh on drift
             if self.cfg.refresh_on_drift:
                 bulk = y_ng[:, O:W - O, :]
                 coll = torch.cat([y_g[:, :O, :], y_g[:, W - O:, :]], dim=1)
                 drift = (bulk.mean() - coll.mean()).abs().item()
                 if drift > float(self.cfg.drift_thresh):
-                    # recompute (or simply keep) the full grad result
                     y = y_g
         else:
-            # regular full-grad path
-            y = self.block(xw)
+            # full-grad path
+            y = self.block(xw, step_hook=integ_hook)
 
-        # Always return windowed hidden for masking/collar loss
-        y_win_bnwd = y.view(B, nwin, W, D)  # [B, nwin, W, D]
+        # 3) Save hidden by window for stitching
+        y_win_bnwd = y.view(B, nwin, W, D)  # [B, n_win, W, D]
 
-        h_full = self._unshape_and_reconstruct(y, B, T, D, nwin)  # [B,T,D]
-        # Head (tied or learned). Keep logits unmasked here; CE handles ignore_index.
-        logits = self.head(h_full, mask=None, mask_behavior="none", traceless=True)
+        # 4) Reconstruct sequence and project to vocab
+        h_full = self._unshape_and_reconstruct(y, B, T, D, nwin)        # [B, T, D]
+        logits = self.head(h_full, mask=None, mask_behavior="none", traceless=True)  # [B, T, V]
 
-        # Debug: state norms and CE alignment (optional)
-        self._maybe_debug_state(h_full, logits, tokens_for_debug)
+        # 5) Optional debug (state norms / CE alignment)
+        self._maybe_debug_state(h_full, logits, tokens, mask)
 
-        # Prepare logits windows [B, n_win, W, V] for stitching if needed
+        # 6) Prepare logits per window if SKL is enabled
         logits_win = None
-        if self.stitch is not None and self.cfg.stitch_use_skl:
+        if (self.stitch is not None) and self.cfg.stitch_use_skl:
             log_w = slice_windows(logits, self.cfg.W, self.cfg.O, axis=1, pad=True)  # [B, V, n_win, W]
             logits_win = log_w.permute(0, 2, 3, 1).contiguous()  # [B, n_win, W, V]
 
@@ -583,15 +618,26 @@ class ContinuousLM(nn.Module):
 
             stats = {"acc": acc, "bpp": bpp_val, "tokens": float(sup_mask.sum().item())}
 
-        # Optional stitching loss on overlaps (unchanged)
+        # Optional stitching loss on overlaps (mask pads/right-padding)
         if self.stitch is not None and (self.cfg.O > 0):
             st_loss_terms = []
             st_stats: Dict[str, float] = {}
+
+            # Build window-level validity mask from token mask (exclude pads/right-padding)
+            Bm, Tm = logits.shape[:2]
+            if 'mask' in locals() and (mask is not None):
+                base_mask = mask.bool()
+            else:
+                base_mask = torch.ones(Bm, Tm, dtype=torch.bool, device=logits.device)
+
+            mw = slice_windows(base_mask.unsqueeze(1).float(), self.cfg.W, self.cfg.O, axis=1, pad=True)  # [B,1,nw,W]
+            mask_win = (mw > 0.5).squeeze(1)  # [B,nw,W]
+
             if self.cfg.stitch_use_skl and logits_win is not None:
                 skl, st = self.stitch(
                     logits=logits_win,
                     h_lowd=None,
-                    mask=None,
+                    mask=mask_win,
                 )
                 st_loss_terms.append(skl)
                 st_stats.update({"st_skl": st.get("skl", 0.0)})
@@ -599,7 +645,7 @@ class ContinuousLM(nn.Module):
                 lmse, st = self.stitch(
                     logits=None,
                     h_lowd=y_win,
-                    mask=None,
+                    mask=mask_win,
                 )
                 st_loss_terms.append(lmse)
                 st_stats.update({"st_lowd": st.get("mse_lowd", 0.0)})
@@ -680,7 +726,7 @@ if __name__ == "__main__":
             cfg = LoopConfig(
                 W=16, O=4,
                 vocab_size=vocab.size, d_model=64, groups=8,
-                cheb_deg=6, cheb_laplacian="path",
+                cheb_deg=6, cheb_laplacian="path_causal",
                 skew_rank=8, R_rank=4,
                 steps=2, dt=0.5, method="heun",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -699,7 +745,7 @@ if __name__ == "__main__":
             cfg = LoopConfig(
                 W=16, O=4,
                 vocab_size=vocab.size, d_model=64, groups=8,
-                cheb_deg=6, cheb_laplacian="path",
+                cheb_deg=6, cheb_laplacian="path_causal",
                 skew_rank=8, R_rank=4,
                 steps=2, dt=0.5, method="heun",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -719,7 +765,7 @@ if __name__ == "__main__":
         cfg = LoopConfig(
             W=16, O=4,
             vocab_size=vocab.size, d_model=64, groups=8,
-            cheb_deg=6, cheb_laplacian="path",
+            cheb_deg=6, cheb_laplacian="path_causal",
             skew_rank=8, R_rank=4,
             steps=2, dt=0.5, method="heun",
             tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -740,6 +786,7 @@ if __name__ == "__main__":
 
     device = torch.device(cfg.device)
     model = ContinuousLM(cfg).to(device)
+    cfg_dict = asdict(cfg)
 
     # Move batch to device
     for k in list(batch.keys()):
@@ -849,7 +896,7 @@ if __name__ == "__main__":
         # Periodic checkpoint save
         ckpt_mgr.periodic_save(
             model=model, optimizer=opt, scheduler=None,
-            step=s, epoch=0, cfg=cfg, every=cfg.save_every,
+            step=s, epoch=0, cfg=cfg_dict, every=cfg.save_every,
             extra={"tokens_seen": int(stats.get("tokens", 0))},
         )
         # Update best using chosen metric (fallback to loss)
@@ -858,7 +905,7 @@ if __name__ == "__main__":
         ckpt_mgr.update_best(
             metric_value=metric_val,
             model=model, optimizer=opt, scheduler=None,
-            step=s, epoch=0, cfg=cfg,
+            step=s, epoch=0, cfg=cfg_dict,
             extra={metric_name: metric_val},
         )
 

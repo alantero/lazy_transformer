@@ -1,6 +1,6 @@
 # operators/cheb.py
 # Chebyshev polynomial filters over a 1D (causal) Laplacian on the time axis.
-# Adds: (1) per-group learnable coeffs in Torch, (2) laplacian="path" (Dirichlet BC).
+# Adds: (1) per-group learnable coeffs in Torch, (2) laplacian="path_causal" (strict AR) and "path" (Dirichlet, non-causal).
 # NumPy/Torch compatible; no external project deps.
 
 from __future__ import annotations
@@ -82,6 +82,27 @@ def _lap_path_dirichlet(x: Any, axis_time: int = -2) -> Any:
     return _move_axis(y, -2, axis_time)
 
 
+# --- Strictly causal path Laplacian (Dirichlet on left, AR) ---
+def _lap_path_causal(x: Any, axis_time: int = -2) -> Any:
+    """
+    Causal (one-sided) path Laplacian with Dirichlet BC on the left only:
+      L_c x = x - 0.5 * (x_{i-1} + x_{i}) with x_{-1}=0.
+    This is strictly causal for autoregressive use (depends only on past/current).
+    Shapes: [..., T, D]
+    """
+    if axis_time < 0: axis_time += x.ndim
+    xt = _move_axis(x, axis_time, -2)  # [..., T, D]
+    if _is_numpy(xt):
+        zeros = _np.zeros_like(xt[..., :1, :])
+        left  = _np.concatenate([zeros, xt[..., :-1, :]], axis=-2)
+        # L_c x = x - 0.5 * (left + current)
+        y = xt - 0.5 * (left + xt)
+    else:
+        left = _F.pad(xt, (0, 0, 1, 0), mode="constant", value=0.0)[..., :-1, :]
+        y = xt - 0.5 * (left + xt)
+    return _move_axis(y, -2, axis_time)
+
+
 def _mu_apply(Lx_fn, x: Any, lmax: float) -> Any:
     """
     Apply μ(L) = 2 L / lmax - I.
@@ -129,17 +150,20 @@ def heat_cheb_coeffs(K: int, tau: float, lmax: float = 2.0) -> "_np.ndarray":
 # -------------------------- Chebyshev filtering -------------------------------
 
 def _select_Lx(laplacian: str, *, allow_noncausal: bool = False):
-    # 'path' is causal (Dirichlet BC). 'cycle' is non-causal (wrap-around).
+    # 'path_causal' is strictly causal (left-only). 'path' is non-causal (looks both left/right).
+    # 'cycle' is non-causal with wrap-around.
+    if laplacian == "path_causal":
+        return _lap_path_causal
     if laplacian == "path":
         return _lap_path_dirichlet
     if laplacian == "cycle":
         if not allow_noncausal:
             raise ValueError(
                 "laplacian='cycle' is non-causal (wrap-around) and is disallowed by default. "
-                "Use laplacian='path' for language modeling, or pass allow_noncausal=True where supported."
+                "Use laplacian='path_causal' for language modeling, or pass allow_noncausal=True where supported."
             )
         return _lap_cycle
-    raise ValueError(f"Unsupported laplacian='{laplacian}'. Use 'path' (causal) or 'cycle' (non-causal).")
+    raise ValueError(f"Unsupported laplacian='{laplacian}'. Use 'path_causal' (causal), 'path' (non-causal), or 'cycle' (non-causal wrap-around).")
 def _cast_like_tensor(t: _torch.Tensor, ref: _torch.Tensor) -> _torch.Tensor:
     return t.to(dtype=ref.dtype, device=ref.device)
 
@@ -261,7 +285,8 @@ if _HAVE_TORCH:
                     Tensor of shape [K+1] or [G,K+1] to set initial coeffs.
             groups: number of feature groups (D % groups == 0).
             lmax: spectral radius used in μ(L)=2L/lmax − I (≈2 for 'cycle', ≈4 for 'path').
-            laplacian: 'cycle' (default) or 'path' (Dirichlet).
+            laplacian: 'path_causal' (strictly causal, recommended for AR),
+                       'path' (non-causal, Dirichlet), or 'cycle' (non-causal wrap-around).
             learnable: whether coeffs are nn.Parameter.
         """
         def __init__(
@@ -369,6 +394,10 @@ if __name__ == "__main__":
         coeff_heat = _torch.tensor(heat_cheb_coeffs(K, tau=0.8, lmax=2.0), dtype=_torch.float32, device=device)
         filt = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=4.0, laplacian="path", learnable=False).to(device)
         y = filt(x)
+
+        # Also exercise strictly causal variant
+        filt_causal = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=2.0, laplacian="path_causal", learnable=False).to(device)
+        yc = filt_causal(x); _ = yc.shape
 
         X = _torch.fft.rfft(x[..., 0], dim=-1)  # take one channel
         Y = _torch.fft.rfft(y[..., 0], dim=-1)

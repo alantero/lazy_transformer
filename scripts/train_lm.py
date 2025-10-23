@@ -139,6 +139,34 @@ def merge_cfg(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]
             out[k] = v
     return out
 
+# --- Helper: filter/normalize config for LoopConfig ---
+from dataclasses import fields as _dc_fields
+def _sanitize_for_loopconfig(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter arbitrary config dict `d` down to the fields accepted by LoopConfig.
+    - If `pad_id` is missing but `eos_id` is present (HF-style), set pad_id = eos_id.
+    - Log and drop keys not present in LoopConfig to avoid `__init__` errors
+      (e.g., bos_id, eos_id, unk_token, etc.).
+    """
+    allowed = {f.name for f in _dc_fields(LoopConfig)}
+    d = dict(d)  # shallow copy
+    # Consolidate pad/eos convention: prefer explicit pad_id; else fall back to eos_id
+    if ("pad_id" not in d or d["pad_id"] is None) and ("eos_id" in d and d["eos_id"] is not None):
+        try:
+            d["pad_id"] = int(d["eos_id"])  # Strategy B: pad == eos
+        except Exception:
+            pass
+    # Build filtered dict and collect ignored keys for logging
+    out: Dict[str, Any] = {}
+    ignored: List[str] = []
+    for k, v in d.items():
+        if k in allowed:
+            out[k] = v
+        else:
+            ignored.append(k)
+    if ignored:
+        logging.info(f"[cfg] ignoring non-LoopConfig keys: {sorted(ignored)}")
+    return out
+
 
 # ------------------------------ NPY Dataset ---------------------------------
 class NpyPackedDataset(Dataset):
@@ -443,6 +471,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", dest="d_model", type=int, default=None)
     p.add_argument("--groups", type=int, default=None)
     p.add_argument("--cheb-deg", dest="cheb_deg", type=int, default=None)
+    p.add_argument("--dt", type=float, default=None, help="Integrator time step (dt) for the dynamics/integrator.")
+    p.add_argument("--integ-method", dest="method", type=str, default=None, choices=["euler", "heun"], help="Integrator method to use (euler or heun).")
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=None)
     p.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
@@ -508,8 +538,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Optional override for Chebyshev laplacian kind
     p.add_argument("--cheb-laplacian", dest="cheb_laplacian", type=str, default=None,
-                  choices=["path", "cycle", "toeplitz"],
-                  help="Laplacian kind used by Chebyshev operator. Use 'path' for causal LM.")
+                  choices=["path_causal", "path", "cycle", "toeplitz"],
+                  help="Laplacian kind for Chebyshev operator. Use 'path_causal' for strict causal LM; 'path' (Dirichlet) is non-causal and only for ablations.")
 
     return p
 @torch.no_grad()
@@ -539,9 +569,16 @@ def evaluate_val_ce(model: torch.nn.Module, val_loader: DataLoader, pad_id: int)
             ignore_index=int(pad_id),
             reduction="sum",
         )
+        # count only valid (non-pad) targets, intersected with mask if provided
+        valid = (y != int(pad_id))
+        if mask is not None:
+            valid = valid & mask
+        ntok = int(valid.sum().item())
         total_loss += float(loss.item())
-        total_tok  += int(B * T)
-        total_acc  += float((logits.argmax(-1) == y).float().mean().item())
+        total_tok  += ntok
+        pred = logits.argmax(-1)
+        batch_acc = float((pred[valid] == y[valid]).float().mean().item()) if ntok > 0 else 0.0
+        total_acc  += batch_acc
     mean_loss = total_loss / max(total_tok, 1)
     ppl = math.exp(mean_loss)
     acc = total_acc / max(1, len(val_loader))
@@ -567,9 +604,15 @@ def evaluate_val_ce_tqdm(model: torch.nn.Module, val_loader: DataLoader, pad_id:
                 ignore_index=int(pad_id),
                 reduction="sum",
             )
+            # count only valid (non-pad) targets, intersected with mask if provided
+            valid = (y != int(pad_id))
+            if mask is not None:
+                valid = valid & mask
+            ntok = int(valid.sum().item())
             total_loss += float(loss.item())
-            total_tok  += int(B * T)
-            batch_acc = float((logits.argmax(-1) == y).float().mean().item())
+            total_tok  += ntok
+            pred = logits.argmax(-1)
+            batch_acc = float((pred[valid] == y[valid]).float().mean().item()) if ntok > 0 else 0.0
             total_acc  += batch_acc
             # live metrics
             mean_loss = total_loss / max(total_tok, 1)
@@ -599,7 +642,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         preset_dict = asdict(LoopConfig(
             W=16, O=4,
             vocab_size=128, d_model=64, groups=8,
-            cheb_deg=6, cheb_laplacian="cycle",
+            cheb_deg=6, cheb_laplacian="path_causal",
             skew_rank=8, R_rank=4,
             steps=2, dt=0.5, method="heun",
             tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -615,6 +658,30 @@ def main(argv: Optional[List[str]] = None) -> None:
             profile=False, profile_nvtx=False, profile_log_mem=False,
             checkpoint_dir="./ckpts", save_every=0, keep_last_k=5, best_metric_name="loss",
         ))
+
+    # Helper to load HF-like config (utils.hf_config or plain JSON)
+    def _load_hf_like_config(path: str) -> Dict[str, Any]:
+        d = {}
+        # Try utils.hf_config first
+        if load_hf_config is not None:
+            try:
+                cfg_hf = load_hf_config(path)
+                d = asdict(cfg_hf)
+                logging.info(f"[hf] loaded HF config via utils.hf_config from {path}")
+                return d
+            except Exception as e:
+                logging.warning(f"[hf] hf_config loader failed for {path}: {e}")
+        # Fallback: plain JSON; allow directory containing config.json
+        cfg_path = path
+        if os.path.isdir(cfg_path):
+            cfg_path = os.path.join(cfg_path, "config.json")
+        try:
+            with open(cfg_path, "r") as f:
+                d = json.load(f)
+            logging.info(f"[hf] loaded plain JSON config from {cfg_path}")
+        except Exception as e:
+            logging.warning(f"[hf] failed to load plain JSON config from {cfg_path}: {e}")
+        return d
 
     # CLI overrides
     overrides = {
@@ -632,51 +699,39 @@ def main(argv: Optional[List[str]] = None) -> None:
         "debug_state_norm": getattr(args, "debug_state_norm", None),
         "debug_topk": getattr(args, "debug_topk", None),
         "cheb_laplacian": getattr(args, "cheb_laplacian", None),
+        "dt": args.dt,
+        "method": args.method,
     }
-    # HF config merge (preset -> HF -> CLI). YAML is optional and not used here.
-    #hf_dict = {}
-    #if args.hf_config is not None and load_hf_config is not None:
-    #    try:
-    #        cfg_hf = load_hf_config(args.hf_config)
-    #        hf_dict = asdict(cfg_hf)
-    #    except Exception as e:
-    #        logging.warning(f"[hf] failed to load HF config: {e}")
 
-    #merged = merge_cfg(preset_dict, hf_dict)
-    #merged = merge_cfg(merged, overrides)
-
-
+    # --- Determine base config source and merge order ---
+    # - If user passes --hf-config, use that.
+    # - Else, if configs/config.json exists, use it as default.
+    # - Else, fall back to preset_dict computed above.
     hf_dict = {}
-    if args.hf_config is not None:
-        if load_hf_config is not None:
-            try:
-                cfg_hf = load_hf_config(args.hf_config)
-                hf_dict = asdict(cfg_hf)
-            except Exception as e:
-                logging.warning(f"[hf] failed to load HF config with utils.hf_config: {e}")
-        if not hf_dict:
-            # Fallback: JSON plano (archivo directo o carpeta con config.json)
-            cfg_path = args.hf_config
-            if os.path.isdir(cfg_path):
-                cfg_path = os.path.join(cfg_path, "config.json")
-            try:
-                with open(cfg_path, "r") as f:
-                    hf_dict = json.load(f)
-                logging.info(f"[hf] loaded plain JSON config from {cfg_path}")
-            except Exception as e:
-                logging.warning(f"[hf] failed to load plain JSON config: {e}")
+    user_hf_path = args.hf_config
+    default_hf_path = os.path.join("configs", "config.json")
+    if user_hf_path is not None:
+        hf_dict = _load_hf_like_config(user_hf_path)
+    elif os.path.exists(default_hf_path):
+        logging.info(f"[hf] using default config at {default_hf_path}")
+        hf_dict = _load_hf_like_config(default_hf_path)
+    else:
+        logging.info("[hf] no HF-style config found; using preset base.")
 
-    merged = merge_cfg(preset_dict, hf_dict)
-    merged = merge_cfg(merged, overrides)
+    # Merge order: base (hf if present, else preset) -> CLI overrides
+    base = hf_dict if hf_dict else preset_dict
+    merged = merge_cfg(base, overrides)
+
+    # Warn if user or base config selected a non-causal Laplacian for AR LM
+    if merged.get("cheb_laplacian") == "path":
+        logging.warning("[cfg] cheb_laplacian='path' is NON-causal (Dirichlet). Prefer 'path_causal' for autoregressive LM to avoid future leakage.")
 
     # Ensure compatibility: LoopConfig has no 'max_len' field.
-    # If pos_kind='learned', fall back to sinusoidal to avoid requiring max_len in TokenEmbedder.
     if merged.get("pos_kind") == "learned":
-        logging.warning("[cfg] pos_kind='learned' requested but LoopConfig has no 'max_len'; falling back to pos_kind='sinusoidal'.")
+        logging.warning("[cfg] pos_kind='learned' requested but LoopConfig has no 'max_len'; falling back to 'sinusoidal'.")
         merged["pos_kind"] = "sinusoidal"
 
-
-
+    merged = _sanitize_for_loopconfig(merged)
     cfg = LoopConfig(**merged)  # type: ignore[arg-type]
 
     # Steps: CLI --steps wins; else take scheduler_total_steps (if given); else 400
@@ -878,7 +933,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
             # Checkpoints
             ckpt_mgr.periodic_save(
-                model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
+                model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=asdict(cfg),
                 every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
             )
             ran_val = False
@@ -890,7 +945,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 metric_val = float(val_metrics["val_loss"])
                 ckpt_mgr.update_best(
                     metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
-                    step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+                    step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
                 )
                 ran_val = True
             if not ran_val:
@@ -899,7 +954,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 if int(args.best_every) <= 1 or (s % int(args.best_every) == 0):
                     ckpt_mgr.update_best(
                         metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
-                        step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+                        step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
                     )
 
             # Scheduler step: non-plateau every step; plateau only on validation
@@ -1058,7 +1113,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         pbar_txt.set_postfix(postfix)
 
         ckpt_mgr.periodic_save(
-            model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=cfg,
+            model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=asdict(cfg),
             every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
         )
         metric_name = cfg.best_metric_name
@@ -1066,7 +1121,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         if int(args.best_every) <= 1 or (s % int(args.best_every) == 0):
             ckpt_mgr.update_best(
                 metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
-                step=s, epoch=0, cfg=cfg, extra={metric_name: metric_val}
+                step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
             )
 
         # Scheduler step: non-plateau every step; plateau only on validation

@@ -15,11 +15,66 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import GPT2TokenizerFast
 
 Tensor = torch.Tensor
 
 
+# --- Config helpers: ckpt por defecto; opcional --hf-config ---
+import json as _json
+import os as _os
+
+def _load_hf_config_fallback(path: str) -> dict:
+    """Carga una config HF (directorio con config.json o archivo JSON)."""
+    cfg_path = path
+    if _os.path.isdir(cfg_path):
+        cfg_path = _os.path.join(cfg_path, "config.json")
+    with open(cfg_path, "r") as f:
+        return _json.load(f)
+
+def _resolve_cfg_from_args_and_ckpt(args, ckpt_state: dict) -> dict:
+    """
+    Por defecto: cfg del checkpoint.
+    Si --hf-config está presente: usar ese config en su lugar.
+    Después, aplicar overrides mínimos de CLI (W/O/cheb_laplacian/dt/method/device).
+    """
+    # 1) base: del checkpoint
+    base = {}
+    for k in ("cfg", "config"):
+        if k in ckpt_state and isinstance(ckpt_state[k], dict):
+            base = dict(ckpt_state[k])
+            break
+
+    # 2) si hay --hf-config, sustituye base por ese
+    if getattr(args, "hf_config", None):
+        try:
+            base = _load_hf_config_fallback(args.hf_config)
+        except Exception as e:
+            print(f"[warn] no se pudo cargar --hf-config '{args.hf_config}': {e}. Sigo con cfg del ckpt.")
+
+    # 3) overrides mínimos desde CLI (solo dinámicos). No tocar geometría (W/O/Laplacian).
+    def _set_if(val, key):
+        if val is not None:
+            base[key] = val
+
+    # Guard: ignorar cambios peligrosos de geometría desde CLI
+    for k_cli, k_cfg in (("W", "W"), ("O", "O"), ("cheb_laplacian", "cheb_laplacian")):
+        if getattr(args, k_cli, None) is not None:
+            print(f"[guard] ignoring CLI override for {k_cli}; using checkpoint config.")
+
+    # Permitir solo overrides dinámicos
+    _set_if(getattr(args, "dt", None), "dt")
+    # NOTE: Do NOT override model cfg 'method' from --method (decoding); instead, allow override from --integ-method
+    _set_if(getattr(args, "integ_method", None), "method")
+    _set_if(getattr(args, "device", None), "device")
+    return base
+
+
 # ------------------------------- helpers --------------------------------------
+
+
+
+
 
 def _last_indices_from_mask(mask: Tensor) -> Tensor:
     """mask [B,T] bool → [B] index of last valid token per sequence."""
@@ -196,11 +251,15 @@ class StreamerConfig:
     # debugging
     debug_topk: bool = False           # if True, print top-10 tokens at the last position
     debug_topk_all: bool = False       # if True, print at every step; otherwise only first step
+    debug_entropy: bool = False        # if True, print normalized entropy and capacity each step (or first step)
 
     # misc
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     pad_id: int = 0
     eos_id: Optional[int] = None
+
+    # overrides
+    force_cheb_laplacian: Optional[str] = None  # if set, override laplacian mode in loaded cfg (e.g., "path")
 
 
 # --------------------------------- Streamer -----------------------------------
@@ -304,6 +363,9 @@ class Streamer:
             H = _entropy_last(last)                        # [B]
             Hn = (H / math.log(float(V))).mean().item()    # normalized entropy in [0,1] approx
             cap = max(0.0, 1.0 - Hn)                       # capacity proxy
+            if getattr(self.cfg, "debug_entropy", False) and ((self._accepted == 0) or getattr(self.cfg, "debug_topk_all", False)):
+                step_idx = int(self._accepted // max(1, tokens.size(0)))
+                print(f"[debug] step={step_idx} H_norm={Hn:.4f} cap={cap:.4f}")
 
             # Optional debug: show top-10 tokens/probs at the last position (sample 0)
             if getattr(self.cfg, "debug_topk", False) and ((self._accepted == 0) or getattr(self.cfg, "debug_topk_all", False)):
@@ -416,7 +478,8 @@ if __name__ == "__main__":
         pass
     torch.manual_seed(0)
     parser = argparse.ArgumentParser(description="Sliding-window streaming for CLO")
-    parser.add_argument("--hf-config", type=str, default="configs/config.json")
+    parser.add_argument("--hf-config", type=str, default=None,
+                       help="Config HF (json o carpeta con config.json). Por defecto uso la config del checkpoint.")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="In a quiet village at the edge of the forest,")
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -424,7 +487,14 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--method", type=str, default="sample", choices=["sample", "typical", "greedy"])
+    parser.add_argument("--method", type=str, default="sample", choices=["sample", "typical", "greedy"],
+                        help="Decoding method (legacy alias, e.g., 'sample', 'greedy', 'typical'). Prefer --decode-method.")
+    parser.add_argument("--integ-method", type=str, default=None,
+                        choices=["euler", "heun", "rk4", "etd-symplectic"],
+                        help="Override the model integrator method in cfg (e.g., 'heun').")
+    parser.add_argument("--decode-method", type=str, default=None,
+                        choices=["sample", "typical", "greedy"],
+                        help="Decoding strategy. If omitted, falls back to --method.")
     parser.add_argument("--typical-p", type=float, default=0.9)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=0)
@@ -436,177 +506,183 @@ if __name__ == "__main__":
     parser.add_argument("--debug-topk-all", action="store_true", help="Print top-10 token ids/probs at every decoding step.")
     parser.add_argument("--zero-head-bias", action="store_true", help="Set output head bias to zero at load time (debugging collapse).")
     parser.add_argument("--print-head-biais-topk", type=int, default=0, help="If >0, print top-K tokens by output head bias (debug).")
+    # New arguments for overrides and debugging/teleport
+    parser.add_argument("--W", type=int, default=None, help="Override model window W for streaming.")
+    parser.add_argument("--O", type=int, default=None, help="Override collar O for streaming.")
+    parser.add_argument("--cheb-laplacian", type=str, default=None, help="Override Laplacian kind (e.g., 'path').")
+    parser.add_argument("--debug-entropy", action="store_true", help="Print normalized entropy/capacity during decoding.")
+    parser.add_argument("--teleport-every", type=int, default=None, help="Force a teleport every N accepted tokens.")
+    parser.add_argument("--teleport-on-low-capacity", action="store_true", help="Teleport when capacity < cap-threshold.")
+    parser.add_argument("--cap-threshold", type=float, default=0.15, help="Capacity threshold for low-capacity teleports.")
+    parser.add_argument("--keep-collar-on-teleport", action="store_true", help="Keep last O tokens when teleporting.")
+    parser.add_argument("--no-teleports", action="store_true", help="Disable all teleport logic.")
+    parser.add_argument("--eos-id", type=int, default=None, help="Override EOS id (defaults to tokenizer.eos_token_id when --eos-stop).")
+    # Back-compat alias (typo) for head bias printing
+    parser.add_argument("--print-head-bias-topk", type=int, default=0, help="If >0, print top-K tokens by output head bias (debug).")
     args = parser.parse_args()
+
+    # --- Determine effective decoding method ---
+    dec_method = args.decode_method if getattr(args, "decode_method", None) else args.method
+
+    # Back-compat: if the old typo flag was used, propagate to the new one
+    if getattr(args, "print_head_biais_topk", 0) and not getattr(args, "print_head_bias_topk", 0):
+        setattr(args, "print_head_bias_topk", getattr(args, "print_head_biais_topk"))
 
     # Ensure repo root is on sys.path when running as a script
     if __package__ in (None, ""):
         import os, sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from train.loop import ContinuousLM, LoopConfig
-    with open(args.hf_config, "r") as f:
-        raw = json.load(f)
-    if str(raw.get("pos_kind", "sinusoidal")).lower() == "learned":
-        raw["pos_kind"] = "sinusoidal"
-
-    # Load tokenizer early to resolve vocab/pad consistently with training (GPT-2: vocab=50257, eos/pad=50256)
-    from transformers import GPT2TokenizerFast
-    tok = GPT2TokenizerFast.from_pretrained("gpt2")
-    tok.pad_token = tok.eos_token
-    tok.model_max_length = 10_000_000
-    vocab_from_tok = int(tok.vocab_size)
-    pad_from_tok = int(tok.eos_token_id)
-
-    # --- Load checkpoint (for weights and possibly cfg) ---
+    # --- Load checkpoint first ---
     try:
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     except Exception as e:
         print(f"[load] weights_only=True failed ({e}); retrying with weights_only=False (trusted local checkpoint)")
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
-    # If checkpoint carries a config, prefer it for core dims (protects against mismatches)
-    ckcfg = None
-    if isinstance(state, dict):
-        ckcfg = state.get("cfg") or state.get("config") or None
-    if isinstance(ckcfg, dict):
-        for k in ["W","O","vocab_size","pad_id","tie_softmax","d_model","groups",
-                  "cheb_deg","cheb_laplacian","skew_rank","R_rank","factor_rank",
-                  "pos_kind","use_gauge"]:
-            if k in ckcfg:
-                raw[k] = ckcfg[k]
+    # --- Resolve final cfg: default = cfg from checkpoint; if --hf-config present, use that; then minimal CLI overrides ---
+    cfg_dict = _resolve_cfg_from_args_and_ckpt(args, state)
+    if not isinstance(cfg_dict, dict) or not cfg_dict:
+        raise RuntimeError("No pude resolver una cfg válida desde el checkpoint ni desde --hf-config.")
 
-    # Build model config from (raw ⟵ maybe-ckpt ⟵ tokenizer guards)
-    vocab_cfg = int(raw.get("vocab_size", vocab_from_tok) or vocab_from_tok)
-    pad_cfg = int(raw.get("pad_id", pad_from_tok))
-    vocab_final = max(vocab_cfg, vocab_from_tok, pad_cfg + 1)
-    pad_final = pad_cfg if pad_cfg < vocab_final else (vocab_final - 1)
+    # Defensive check for critical keys
+    _required = ("vocab_size","pad_id","W","O","d_model","groups","cheb_deg","cheb_laplacian",
+                 "skew_rank","R_rank","steps","dt","method","tie_softmax","factor_rank","pos_kind","device")
+    _missing = [k for k in _required if k not in cfg_dict]
+    if _missing:
+        raise KeyError(f"Faltan claves en cfg: {_missing}")
 
-    cfg_m = LoopConfig(
-        W=raw.get("W", 1024), O=raw.get("O", 64),
-        vocab_size=vocab_final, d_model=raw.get("d_model", 384), groups=raw.get("groups", 16),
-        cheb_deg=raw.get("cheb_deg", 8), cheb_laplacian=raw.get("cheb_laplacian", "cycle"),
-        skew_rank=raw.get("skew_rank", 8), R_rank=raw.get("R_rank", 4),
-        steps=2, dt=0.5, method="heun",
-        tie_softmax=raw.get("tie_softmax", True), factor_rank=raw.get("factor_rank", 64),
-        pos_kind=raw.get("pos_kind", "sinusoidal"), pad_id=pad_final,
-        lr=raw.get("lr", 5e-4), weight_decay=raw.get("weight_decay", 0.1),
-        device=args.device, use_gauge=raw.get("use_gauge", True),
-        stitch_w=raw.get("stitch_w", 0.10), stitch_use_lowd=raw.get("stitch_use_lowd", True), stitch_use_skl=raw.get("stitch_use_skl", False),
-        scheduler_name="warmup_cosine", scheduler_total_steps=200, scheduler_warmup_steps=20, scheduler_min_lr=3e-4,
-        profile=False, profile_nvtx=False, profile_log_mem=False,
-        checkpoint_dir="./ckpts", save_every=0, keep_last_k=5, best_metric_name="loss",
-    )
-    device = torch.device(args.device)
+    cfg_m = LoopConfig(**cfg_dict)
+    # Sanity guard: requerimos Laplaciano causal para evitar fuga al futuro.
+    cheb_kind = str(getattr(cfg_m, "cheb_laplacian", ""))
+    if cheb_kind != "path_causal":
+        raise SystemExit(
+            f"[error] cfg.cheb_laplacian='{cheb_kind}' (non-causal). "
+            f"CLO-streamer espera 'path_causal' para enmascarar el futuro. "
+            f"Reentrena o convierte el checkpoint a la variante causal."
+        )
+    device = torch.device(cfg_m.device)
     model = ContinuousLM(cfg_m).to(device).eval()
 
     # Load weights (accept both {'model': sd} and raw sd)
     sd = state.get("model", state) if isinstance(state, dict) else state
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        print(f"[load] missing keys: {len(missing)} e.g. {missing[:5]}")
-    if unexpected:
-        print(f"[load] unexpected keys: {len(unexpected)} e.g. {unexpected[:5]}")
+    # Filter cosmetic aliases from older checkpoints (we standardized on `head.*`)
+    unexpected = [k for k in unexpected if not k.startswith("lm_head.")]
+    # Only print load diagnostics when explicit debug flags are enabled
+    if getattr(args, "debug_topk", False) or getattr(args, "debug_entropy", False):
+        if missing:
+            print(f"[load] missing keys: {len(missing)} e.g. {missing[:5]}")
+        if unexpected:
+            print(f"[load] unexpected keys: {len(unexpected)} e.g. {unexpected[:5]}")
 
-    # --- Inspect/zero output head bias (robust) ---
-    try:
-        # Heuristic: find a Linear whose out_features == vocab_size (the LM head)
-        def _find_vocab_linear(module: nn.Module, vocab_size: int) -> Optional[nn.Linear]:
-            for m in module.modules():
-                if isinstance(m, nn.Linear) and getattr(m, "out_features", None) == int(vocab_size):
-                    return m  # first match
-            return None
+    # --- Inspect/zero output head bias (optional; only if flags request it) ---
+    if (getattr(args, "zero_head_bias", False) or (getattr(args, "print_head_bias_topk", 0) and int(args.print_head_bias_topk) > 0)):
+        try:
+            # Heuristic: find a Linear whose out_features == vocab_size (the LM head)
+            def _find_vocab_linear(module: nn.Module, vocab_size: int) -> Optional[nn.Linear]:
+                for m in module.modules():
+                    if isinstance(m, nn.Linear) and getattr(m, "out_features", None) == int(vocab_size):
+                        return m  # first match
+                return None
 
-        head_module: Optional[nn.Linear] = None
+            head_module: Optional[nn.Linear] = None
 
-        # 1) Try common attribute names
-        for name in ("output_head", "head", "lm_head"):
-            if hasattr(model, name):
-                cand = getattr(model, name)
-                if isinstance(cand, nn.Linear) and getattr(cand, "out_features", None) == int(cfg_m.vocab_size):
-                    head_module = cand
-                    break
-
-        # 2) Fallback: scan the whole model
-        if head_module is None:
-            head_module = _find_vocab_linear(model, int(cfg_m.vocab_size))
-
-        if head_module is None:
-            print("[warn] could not locate output head Linear (to vocab).")
-        else:
-            print(f"[debug] found output head: {head_module.__class__.__name__}(in={getattr(head_module,'in_features',None)}, out={getattr(head_module,'out_features',None)})")
-
-            # Print top-K bias entries if requested
-            if args.print_head_biais_topk and int(args.print_head_biais_topk) > 0:
-                if getattr(head_module, "bias", None) is not None:
-                    with torch.no_grad():
-                        b = head_module.bias.detach().cpu()
-                        k = int(min(int(args.print_head_biais_topk), b.numel()))
-                        topv, topi = torch.topk(b, k=k, largest=True)
-                        print(f"[debug] head.bias top{k} ids:", topi.tolist())
-                        print(f"[debug] head.bias top{k} values:", [float(v) for v in topv])
-                else:
-                    print("[debug] head has no bias (nothing to print).")
-
-            # Zero the bias if requested
-            if args.zero_head_bias:
-                if getattr(head_module, "bias", None) is not None:
-                    with torch.no_grad():
-                        head_module.bias.zero_()
-                    print("[debug] zeroed output head bias.")
-                else:
-                    print("[debug] head has no bias to zero.")
-
-        # --- Fallback: scan for a vocab-sized bias Parameter (tied-head case) ---
-        if head_module is None:
-            bias_param = None
-            bias_name = None
-            vocab_N = int(cfg_m.vocab_size)
-            for name, p in model.named_parameters():
-                # Look for 1D bias-like parameters exactly of size vocab_size
-                if p.ndim == 1 and p.numel() == vocab_N:
-                    # Heuristics: prefer names that contain 'bias' or 'out'
-                    if ('bias' in name.lower()) or ('out' in name.lower()) or ('head' in name.lower()):
-                        bias_param = p
-                        bias_name = name
-                        break
-            # If none matched the heuristic, accept the first 1D param of vocab size
-            if bias_param is None:
-                for name, p in model.named_parameters():
-                    if p.ndim == 1 and p.numel() == vocab_N:
-                        bias_param = p
-                        bias_name = name
+            # 1) Try common attribute names
+            for name in ("output_head", "head", "lm_head"):
+                if hasattr(model, name):
+                    cand = getattr(model, name)
+                    if isinstance(cand, nn.Linear) and getattr(cand, "out_features", None) == int(cfg_m.vocab_size):
+                        head_module = cand
                         break
 
-            if bias_param is not None:
-                print(f"[debug] found vocab-sized bias param: {bias_name} shape={tuple(bias_param.shape)}")
-                if args.print_head_biais_topk and int(args.print_head_biais_topk) > 0:
-                    with torch.no_grad():
-                        b = bias_param.detach().cpu()
-                        k = int(min(int(args.print_head_biais_topk), b.numel()))
-                        topv, topi = torch.topk(b, k=k, largest=True)
-                        print(f"[debug] bias(top){k} ids:", topi.tolist())
-                        print(f"[debug] bias(top){k} values:", [float(v) for v in topv])
-                if args.zero_head_bias:
-                    with torch.no_grad():
-                        bias_param.zero_()
-                    print(f"[debug] zeroed vocab-sized bias param: {bias_name}")
+            # 2) Fallback: scan the whole model
+            if head_module is None:
+                head_module = _find_vocab_linear(model, int(cfg_m.vocab_size))
+
+            if head_module is not None:
+                if getattr(args, "print_head_bias_topk", 0) and int(args.print_head_bias_topk) > 0:
+                    if getattr(head_module, "bias", None) is not None:
+                        with torch.no_grad():
+                            b = head_module.bias.detach().cpu()
+                            k = int(min(int(args.print_head_bias_topk), b.numel()))
+                            topv, topi = torch.topk(b, k=k, largest=True)
+                            print(f"[debug] head.bias top{k} ids:", topi.tolist())
+                            print(f"[debug] head.bias top{k} values:", [float(v) for v in topv])
+                    else:
+                        print("[debug] head has no bias (nothing to print).")
+
+                if getattr(args, "zero_head_bias", False):
+                    if getattr(head_module, "bias", None) is not None:
+                        with torch.no_grad():
+                            head_module.bias.zero_()
+                        print("[debug] zeroed output head bias.")
+                    else:
+                        print("[debug] head has no bias to zero.")
             else:
-                print("[warn] could not locate output head Linear nor a vocab-sized bias Parameter.")
+                # --- Fallback: scan for a vocab-sized bias Parameter (tied-head case) ---
+                bias_param = None
+                bias_name = None
+                vocab_N = int(cfg_m.vocab_size)
+                for name, p in model.named_parameters():
+                    if p.ndim == 1 and p.numel() == vocab_N and (('bias' in name.lower()) or ('out' in name.lower()) or ('head' in name.lower())):
+                        bias_param = p
+                        bias_name = name
+                        break
+                if bias_param is None:
+                    for name, p in model.named_parameters():
+                        if p.ndim == 1 and p.numel() == vocab_N:
+                            bias_param = p
+                            bias_name = name
+                            break
+
+                if bias_param is not None:
+                    if getattr(args, "print_head_bias_topk", 0) and int(args.print_head_bias_topk) > 0:
+                        with torch.no_grad():
+                            b = bias_param.detach().cpu()
+                            k = int(min(int(args.print_head_bias_topk), b.numel()))
+                            topv, topi = torch.topk(b, k=k, largest=True)
+                            print(f"[debug] bias(top){k} ids:", topi.tolist())
+                            print(f"[debug] bias(top){k} values:", [float(v) for v in topv])
+                    if getattr(args, "zero_head_bias", False):
+                        with torch.no_grad():
+                            bias_param.zero_()
+                        print(f"[debug] zeroed vocab-sized bias param: {bias_name}")
+                else:
+                    if getattr(args, "debug_topk", False) or getattr(args, "debug_entropy", False):
+                        print("[warn] could not locate output head Linear nor a vocab-sized bias Parameter.")
+        except Exception as e:
+            if getattr(args, "debug_topk", False) or getattr(args, "debug_entropy", False):
+                print(f"[warn] head-bias debug failed: {e}")
+
+
+
+
+
+
+
+
+    # --- Tokenizer: load GPT-2 and align with checkpoint cfg (pad/vocab) ---
+    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    # Default: if no pad set, use EOS as pad for safety
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    # If the trained model has one extra token (pad) appended to GPT-2, add it here so decode() works
+    try:
+        if int(cfg_m.vocab_size) == int(tok.vocab_size) + 1 and int(cfg_m.pad_id) == int(tok.vocab_size):
+            tok.add_special_tokens({"pad_token": "<|pad|>"})
+            # ensure pad_token property is consistent
+            tok.pad_token = "<|pad|>"
     except Exception as e:
-        print(f"[warn] head-bias debug failed: {e}")
-
-
-
-
-
-
-
+        print(f"[warn] tokenizer alignment: {e}")
 
     enc = tok(args.prompt, return_tensors="pt", add_special_tokens=False)
     tokens = enc["input_ids"].to(device)
     mask = enc.get("attention_mask", None)
     if mask is not None: mask = mask.to(device)
 
-    print(f"[debug] prompt_len_tokens={tokens.size(1)} | model_W={int(raw.get('W', cfg_m.W))} | model_O={int(raw.get('O', cfg_m.O))}")
+    if getattr(args, "debug_topk", False) or getattr(args, "debug_entropy", False):
+        print(f"[debug] prompt_len_tokens={tokens.size(1)} | model_W={int(cfg_m.W)} | model_O={int(cfg_m.O)}")
 
     # Sanity: head dimension must match vocab_size
     with torch.no_grad():
@@ -618,26 +694,38 @@ if __name__ == "__main__":
         raise SystemExit(f"[error] head dim V={V} != cfg.vocab_size={int(cfg_m.vocab_size)}. "
                          f"Check tokenizer/ckpt/config alignment.")
 
-    # Debug: show what common suspect IDs decode to (e.g., 11 is often ',' in GPT-2)
-    try:
-        for suspect in [11, tok.eos_token_id, 0]:
-            if 0 <= int(suspect) < V:
-                print(f"[debug] suspect id {int(suspect)} decodes to: '{tok.decode([int(suspect)], skip_special_tokens=False)}'")
-    except Exception as _e:
-        print(f"[warn] token decode debug failed: {_e}")
+    if getattr(args, "debug_topk", False):
+        try:
+            for suspect in [11, tok.eos_token_id, 0]:
+                if 0 <= int(suspect) < V:
+                    print(f"[debug] suspect id {int(suspect)} decodes to: '{tok.decode([int(suspect)], skip_special_tokens=False)}'")
+        except Exception as _e:
+            if getattr(args, "debug_topk", False) or getattr(args, "debug_entropy", False):
+                print(f"[warn] token decode debug failed: {_e}")
+
+    # Teleport controls
+    tp_every = None if args.no_teleports else args.teleport_every
+    tp_on_low = (False if args.no_teleports else bool(args.teleport_on_low_capacity))
+    keep_collar = (False if args.no_teleports else bool(args.keep_collar_on_teleport))
+    # EOS override
+    eos_override = int(args.eos_id) if (args.eos_id is not None) else (int(tok.eos_token_id) if args.eos_stop else None)
 
     cfg_s = StreamerConfig(
         W=cfg_m.W, O=cfg_m.O,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
-        method=args.method, typical_p=args.typical_p,
+        method=dec_method, typical_p=args.typical_p,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
         min_p=args.min_p,
         stop_on_optimum=not args.no_stop_on_optimum, opt_window=8, opt_patience=4, opt_eps=1e-3, min_new_tokens=max(2, args.min_new_tokens),
-        teleport_every=None, teleport_on_low_capacity=False, cap_threshold=0.10, keep_collar_on_teleport=True,
+        teleport_every=tp_every,
+        teleport_on_low_capacity=tp_on_low,
+        cap_threshold=float(args.cap_threshold),
+        keep_collar_on_teleport=keep_collar,
         debug_topk=bool(args.debug_topk),
         debug_topk_all=bool(args.debug_topk_all),
-        device=str(device), pad_id=cfg_m.pad_id, eos_id=int(tok.eos_token_id) if args.eos_stop else None,
+        debug_entropy=bool(args.debug_entropy),
+        device=str(device), pad_id=cfg_m.pad_id, eos_id=eos_override,
     )
     streamer = Streamer(model, cfg_s)
     out = streamer.generate(tokens, mask, max_new_tokens=args.max_new_tokens)

@@ -27,6 +27,8 @@ def _has_attr(x: Any, name: str) -> bool:
     return hasattr(x, name) and callable(getattr(x, name))
 
 
+
+
 # ------------------------------- Integrator ----------------------------------
 
 class Integrator(nn.Module):
@@ -70,14 +72,14 @@ class Integrator(nn.Module):
 
     # ------------------------------- internals --------------------------------
 
-    def _guard_dt(self, k: Tensor, dt: float) -> float:
+    def _guard_dt(self, k: Tensor, dt: float) -> Tuple[float, float]:
         if self.limit_rms is None:
-            return dt
-        k_rms = _rms(k)
-        if k_rms.item() <= 0:
-            return dt
-        scale = min(1.0, self.limit_rms / (k_rms.item() * abs(dt) + 1e-12))
-        return float(dt * scale)
+            return float(dt), float(_rms(k).item())
+        k_r = float(_rms(k).item())
+        if k_r <= 0:
+            return float(dt), k_r
+        scale = min(1.0, self.limit_rms / (k_r * abs(dt) + 1e-12))
+        return float(dt * scale), k_r
 
     def _f(self, h: Tensor, **field_kwargs) -> Tensor:
         out = self.field(h, **field_kwargs) if isinstance(self.field, nn.Module) else self.field(h, **field_kwargs)
@@ -87,29 +89,62 @@ class Integrator(nn.Module):
             raise ValueError(f"field returned shape {tuple(out.shape)}, expected {tuple(h.shape)}.")
         return out
 
+    def _call_hook(self, hook, s: int, name: str, x: Tensor, x_next: Tensor, dt_eff: float, k_rms: Optional[float] = None) -> None:
+        """Safely invoke optional per-step hook for logging/diagnostics.
+        Never raises; computes simple RMS-based stats.
+        """
+        if hook is None:
+            return
+        try:
+            with torch.no_grad():
+                dx = x_next - x
+                x_rms = _rms(x).item()
+                dx_rms = _rms(dx).item()
+                k_est_rms = (dx_rms / (abs(dt_eff) + 1e-12)) if dt_eff != 0.0 else 0.0
+                payload = {
+                    "step": int(s),
+                    "method": str(name),
+                    "dt_eff": float(dt_eff),
+                    "x_rms": float(x_rms),
+                    "dx_rms": float(dx_rms),
+                    "k_rms": float(k_rms) if k_rms is not None else float(k_est_rms),
+                    "k_est_rms": float(k_est_rms),
+                }
+                hook(payload)
+        except Exception:
+            # Do not let diagnostics break the training/inference loop
+            pass
+
     # --------------------------------- steps ----------------------------------
 
-    def _step_euler(self, h: Tensor, dt: float, **kw) -> Tensor:
+    def _step_euler(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
-        dt1 = self._guard_dt(k1, dt)
-        return h + dt1 * k1
+        dt1, k1_r = self._guard_dt(k1, dt)
+        out = h + dt1 * k1
+        self._call_hook(hook, s, "euler", h, out, dt1, k1_r)
+        return out
 
-    def _step_heun(self, h: Tensor, dt: float, **kw) -> Tensor:
+    def _step_heun(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
-        dt1 = self._guard_dt(k1, dt)
+        dt1, k1_r = self._guard_dt(k1, dt)
         h1 = h + dt1 * k1
         k2 = self._f(h1, **kw)
         k_avg = 0.5 * (k1 + k2)
-        dt2 = self._guard_dt(k_avg, dt)
-        return h + dt2 * k_avg
+        dt2, k_avg_r = self._guard_dt(k_avg, dt)
+        out = h + dt2 * k_avg
+        self._call_hook(hook, s, "heun", h, out, dt2, k_avg_r)
+        return out
 
-    def _step_rk4(self, h: Tensor, dt: float, **kw) -> Tensor:
+    def _step_rk4(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
-        dt_eff = self._guard_dt(k1, dt)
+        dt_eff, k1_r = self._guard_dt(k1, dt)
         k2 = self._f(h + 0.5 * dt_eff * k1, **kw)
         k3 = self._f(h + 0.5 * dt_eff * k2, **kw)
         k4 = self._f(h + dt_eff * k3, **kw)
-        return h + (dt_eff / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        out = h + (dt_eff / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        # Use k1 RMS as a proxy for logging
+        self._call_hook(hook, s, "rk4", h, out, dt_eff, k1_r)
+        return out
 
     # ------------------------- ETD–symplectic step ----------------------------
     # This step targets fields of the form f(h) = (J - R) G h (e.g., PortHamiltonianStep).
@@ -117,7 +152,7 @@ class Integrator(nn.Module):
     #   (i) Dissipative ETD: y <- exp(-dt * R) (G h)  [exact for diagonal R; low-rank part first-order]
     #  (ii) Skew "wave" step for J via midpoint/leapfrog: y <- y + dt * J(y + 0.5 dt J y)
     # If the field doesn't expose the needed hooks, we gracefully fall back to Heun.
-    def _step_etd_symplectic(self, h: Tensor, dt: float, **kw) -> Tensor:
+    def _step_etd_symplectic(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
         f = self.field
         # Check duck-typed hooks
         hasG = _has_attr(f, "_apply_G")
@@ -125,7 +160,7 @@ class Integrator(nn.Module):
         hasJ = _has_attr(f, "_apply_J")
         if not (hasG and hasR and hasJ):
             # Fallback
-            return self._step_heun(h, dt, **kw)
+            return self._step_heun(h, dt, s, hook, **kw)
 
         B, T, D = h.shape
         y = h.view(B * T, D)  # flatten for last-dim linear ops
@@ -170,7 +205,9 @@ class Integrator(nn.Module):
         Jy_mid = f._apply_J(y_mid)
         y = y + dt * Jy_mid
 
-        return y.view(B, T, D)
+        out = y.view(B, T, D)
+        self._call_hook(hook, s, "etd-symplectic", h, out, dt, None)
+        return out
 
     # -------------------------------- forward ---------------------------------
 
@@ -182,6 +219,7 @@ class Integrator(nn.Module):
         dt: Optional[float] = None,
         record_path: Optional[bool] = None,
         should_step: Optional[Callable[[Tensor, Tensor, int], bool]] = None,
+        step_hook: Optional[Callable[[Dict[str, float]], None]] = None,
         **field_kwargs,
     ) -> Tensor | Tuple[Tensor, List[Tensor]]:
         """
@@ -190,6 +228,7 @@ class Integrator(nn.Module):
         Parameters:
             record_path: override constructor flag to return (h_T, [h_0,...,h_T]).
             should_step(prev, cur, s): optional gate; if returns False at step s, stop early.
+            step_hook: optional callable receiving step info dict for logging/monitoring.
 
         Any extra keyword arguments are forwarded to the field: f(h, **field_kwargs).
         """
@@ -212,7 +251,7 @@ class Integrator(nn.Module):
             path = [x.detach().clone()]
 
         for s in range(S):
-            x_next = step_fn(x, dT, **field_kwargs)
+            x_next = step_fn(x, dT, s, step_hook, **field_kwargs)
             if self.detach_between_steps:
                 x_next = x_next.detach()
 
@@ -263,7 +302,12 @@ if __name__ == "__main__":
 
     h0 = torch.randn(B, T, D)
     integ = Integrator(SkewField(), method="heun", dt=0.1, steps=50, limit_rms=0.5)
-    hT = integ(h0)
+
+    def demo_hook(info: Dict[str, float]):
+        if info["step"] in (0, 25, 49):
+            print(f"[hook] s={info['step']} method={info['method']} dt={info['dt_eff']:.3f} x_rms={info['x_rms']:.3f} k_rms={info['k_rms']:.3f}")
+    hT = integ(h0, step_hook=demo_hook)
+
     n0 = torch.linalg.vector_norm(h0, dim=-1).mean().item()
     nT = torch.linalg.vector_norm(hT, dim=-1).mean().item()
     drift = abs(nT - n0) / (n0 + 1e-12)

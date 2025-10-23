@@ -61,6 +61,11 @@ class PortHamiltonianStep(nn.Module):
         traceless: bool = True,  # if True, apply groupwise traceless on input
         eps: float = 1e-6,
         nonneg_R_scale: bool = True,
+        j_max: float = 1.0,
+        r_max: float = 1.0,
+        g_fro_max: float | None = None,
+        clamp_act: bool = False,
+        clamp_value: float = 3.0,
     ):
         super().__init__()
         if d <= 0:
@@ -76,6 +81,11 @@ class PortHamiltonianStep(nn.Module):
         self.traceless = bool(traceless)
         self.eps = float(eps)
         self.nonneg_R_scale = bool(nonneg_R_scale)
+        self.j_max = float(j_max)
+        self.r_max = float(r_max)
+        self.g_fro_max = float(g_fro_max) if g_fro_max is not None else None
+        self.clamp_act = bool(clamp_act)
+        self.clamp_value = float(clamp_value)
 
         # --- G: block-diagonal (groupwise) mixing, identity init ---
         W = torch.eye(self.cg).repeat(self.groups, 1, 1)     # [G, cg, cg]
@@ -88,13 +98,13 @@ class PortHamiltonianStep(nn.Module):
             self.V = nn.Parameter(torch.zeros(d, r))
             nn.init.normal_(self.U, std=0.02)
             nn.init.normal_(self.V, std=0.02)
-            self.J_scale = nn.Parameter(torch.tensor(0.0))   # lazy-minimal init
+            self.J_logscale = nn.Parameter(torch.tensor(0.0))
             self._mode_full_J = False
         else:
             # Full skew via antisymmetrization
             self.M = nn.Parameter(torch.zeros(d, d))
             nn.init.normal_(self.M, std=0.02)
-            self.J_scale = nn.Parameter(torch.tensor(0.0))   # lazy-minimal init
+            self.J_logscale = nn.Parameter(torch.tensor(0.0))
             self._mode_full_J = True
 
         # --- R: PSD = diag(softplus) + B B^T ---
@@ -113,28 +123,46 @@ class PortHamiltonianStep(nn.Module):
         self.R_logscale = nn.Parameter(torch.tensor(-20.0))  # softplus(-20) ~ 2e-9
     def _R_scale(self) -> torch.Tensor:
         if self.nonneg_R_scale:
-            # strictly non-negative scale with near-zero start
-            return F.softplus(self.R_logscale) + self.eps
+            # strictly non-negative and upper-bounded; add eps to avoid exact zero
+            return self.r_max * torch.sigmoid(self.R_logscale) + self.eps
         else:
             # fall back to raw (can be negative)
             return self.R_logscale
 
+    def _J_scale(self) -> torch.Tensor:
+        # Bound |J| by j_max using a smooth squashing. tanh(0)=0 ⇒ starts at 0.
+        return self.j_max * torch.tanh(self.J_logscale)
+
     # ------------------------------- internals --------------------------------
 
+    def _G_eff(self) -> torch.Tensor:
+        """
+        Return an effective G with optional per-block Frobenius-norm clipping.
+        Does not modify parameters in-place; keeps autograd graph intact.
+        """
+        if self.g_fro_max is None:
+            return self.G
+        G, cg, _ = self.G.shape
+        W = self.G
+        # Compute Frobenius norm per block: [G]
+        norms = W.view(G, -1).norm(dim=1) + 1e-12
+        scales = torch.clamp(self.g_fro_max / norms, max=1.0).view(G, 1, 1)
+        return W * scales
+
     def _apply_G(self, h: torch.Tensor) -> torch.Tensor:
-        return _apply_blockdiag(self.G, h, self.groups)
+        return _apply_blockdiag(self._G_eff(), h, self.groups)
 
     def _apply_J(self, y: torch.Tensor) -> torch.Tensor:
         if self._mode_full_J:
             J = self.M - self.M.t()                           # skew
-            return self.J_scale * (y @ J.t())
+            return self._J_scale() * (y @ J.t())
         else:
             # (U V^T − V U^T) y = U(V^T y) − V(U^T y)
             U, V = self.U, self.V
             tU = y @ U                                        # [N, r]
             tV = y @ V                                        # [N, r]
             out = tU @ V.t() - tV @ U.t()                     # [N, D]
-            return self.J_scale * out
+            return self._J_scale() * out
 
     def _apply_R(self, y: torch.Tensor) -> torch.Tensor:
         out = 0.0
@@ -164,6 +192,9 @@ class PortHamiltonianStep(nn.Module):
             x = _traceless_groupwise(h, self.groups)
         else:
             x = h
+        if self.clamp_act:
+            # Smooth clamp to control explosion at the window's edge.
+            x = torch.tanh(x) * self.clamp_value
 
         y = x.reshape(B * T, D)       # flatten time/batch for linear ops on last dim
         y = self._apply_G(y)          # block-diagonal mixing
@@ -190,9 +221,9 @@ if __name__ == "__main__":
     # Check J skew-symmetry numerically
     with torch.no_grad():
         if step._mode_full_J:
-            J = (step.M - step.M.t()) * step.J_scale
+            J = (step.M - step.M.t()) * step._J_scale()
         else:
-            J = step.J_scale * (step.U @ step.V.t() - step.V @ step.U.t())
+            J = step._J_scale() * (step.U @ step.V.t() - step.V @ step.U.t())
         sym_inf = (J + J.t()).abs().max().item()
         print(f"[portham] ||J+J^T||_∞ ≈ {sym_inf:.2e}")
         assert sym_inf < 1e-6
@@ -213,3 +244,10 @@ if __name__ == "__main__":
         assert mu_max < 1e-6
 
     print("[portham] All good ✓")
+
+    # Smoke test: enable clamps/gates and ensure forward is finite
+    step.clamp_act = True
+    step.g_fro_max = 1.0
+    with torch.no_grad():
+        _ = step(h)
+        print("[portham] gates ok ✓")

@@ -2,7 +2,7 @@
   "W": 1024,
   "O": 64,
 
-  "vocab_size": 50256,
+  "vocab_size": 50258,
   "d_model": 384,
   "groups": 16,
 
@@ -18,7 +18,8 @@
   "tie_softmax": true,
   "factor_rank": 64,
   "pos_kind": "sinusoidal",
-  "pad_id": 50256,
+  "pad_id": 50257,
+  "eos_id": 50256,
 
   "lr": 0.0005,
   "weight_decay": 0.1,
@@ -30,8 +31,8 @@
   "stitch_use_skl": false,
 
   "scheduler_name": "warmup_cosine",
-  "scheduler_total_steps": 230,
-  "scheduler_warmup_steps": 200,
+  "scheduler_total_steps": 1000,
+  "scheduler_warmup_steps": 60,
   "scheduler_min_lr": 0.00005,
 
   "profile": false,
@@ -49,3 +50,4 @@
 
   "grads_border_only": false
 }
+

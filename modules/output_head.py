@@ -49,6 +49,8 @@ class OutputHead(nn.Module):
         scale_by_sqrt_d: if True, scale hidden states by 1/sqrt(d_model) before the projection (useful with weight tying to stabilize logits in fp16/bf16).
         cast_dtype: when tying, cast provided weights/bias to match the hidden's dtype.
         cast_device: when tying, move provided weights/bias to the same device as the hidden.
+        pre_norm: if True, apply a LayerNorm to h just before projecting to logits.
+        norm_eps: epsilon used in the LayerNorm.
         forbid_token_id: if set, the corresponding column in logits is set to -inf (useful to ban a padding token from being predicted).
     """
     def __init__(
@@ -64,6 +66,8 @@ class OutputHead(nn.Module):
         scale_by_sqrt_d: bool = False,
         cast_dtype: bool = True,
         cast_device: bool = True,
+        pre_norm: bool = True,
+        norm_eps: float = 1e-5,
         forbid_token_id: Optional[int] = None,
     ):
         super().__init__()
@@ -78,6 +82,13 @@ class OutputHead(nn.Module):
         self.cast_dtype = bool(cast_dtype)
         self.cast_device = bool(cast_device)
         self.forbid_token_id = forbid_token_id
+
+        # Optional pre-head normalization (helps keep logits well-scaled)
+        self.pre_norm = bool(pre_norm)
+        if self.pre_norm:
+            self.norm = nn.LayerNorm(self.d_model, eps=float(norm_eps))
+        else:
+            self.register_module("norm", None)
 
         # Internal state
         self._lazy_bias_pending = False  # for lazy creation when tying with unknown V
@@ -172,6 +183,10 @@ class OutputHead(nn.Module):
         if traceless:
             h = _traceless_last(h)
 
+        # Optional pre-head normalization
+        if getattr(self, "norm", None) is not None:
+            h = self.norm(h)
+
         # Select weight/bias
         if self.tie_weight:
             tied = self.get_tied()
@@ -241,6 +256,11 @@ if __name__ == "__main__":
     logits = head(h, traceless=True)
     assert logits.shape == (B, T, V)
     print(f"[output_head] learned head logits: {tuple(logits.shape)}")
+
+    head_norm = OutputHead(vocab_size=V, d_model=D, tie_weight=False, pre_norm=True)
+    logits_norm = head_norm(h)
+    assert logits_norm.shape == (B, T, V)
+    print("[output_head] pre-norm path ok")
 
     # 2) Tied path with explicit vocab + provider weight
     W = torch.randn(V, D)
