@@ -46,15 +46,10 @@ class OutputHead(nn.Module):
         learn_bias: when tying and provider doesn't give a bias, learn a local bias.
         temperature: scale logits by 1/temperature (temperature>0).
         init_std: std for normal init of learned W (no tying).
-
-    Forward:
-        h: [B, T, d] → logits: [B, T, V]
-        mask (optional): [B, T] bool. If provided:
-            - mask_behavior='neg_inf' → logits[~mask] = -inf
-            - mask_behavior='zero'    → logits[~mask] = 0.0
-            - mask_behavior='ignore'  → return logits unchanged (handle in loss via ignore_index)
-            - mask_behavior='none'    → alias of 'ignore'
-        traceless (optional): if True, center h along last dim before matmul (logits centered).
+        scale_by_sqrt_d: if True, scale hidden states by 1/sqrt(d_model) before the projection (useful with weight tying to stabilize logits in fp16/bf16).
+        cast_dtype: when tying, cast provided weights/bias to match the hidden's dtype.
+        cast_device: when tying, move provided weights/bias to the same device as the hidden.
+        forbid_token_id: if set, the corresponding column in logits is set to -inf (useful to ban a padding token from being predicted).
     """
     def __init__(
         self,
@@ -66,6 +61,10 @@ class OutputHead(nn.Module):
         learn_bias: bool = False,
         temperature: float = 1.0,
         init_std: float = 0.02,
+        scale_by_sqrt_d: bool = False,
+        cast_dtype: bool = True,
+        cast_device: bool = True,
+        forbid_token_id: Optional[int] = None,
     ):
         super().__init__()
         if d_model <= 0:
@@ -74,6 +73,11 @@ class OutputHead(nn.Module):
         self.d_model = int(d_model)
         self.tie_weight = bool(tie_weight)
         self.temperature = float(max(temperature, 1e-8))
+
+        self.scale_by_sqrt_d = bool(scale_by_sqrt_d)
+        self.cast_dtype = bool(cast_dtype)
+        self.cast_device = bool(cast_device)
+        self.forbid_token_id = forbid_token_id
 
         # Internal state
         self._lazy_bias_pending = False  # for lazy creation when tying with unknown V
@@ -161,6 +165,9 @@ class OutputHead(nn.Module):
         if h.dim() != 3 or h.size(-1) != self.d_model:
             raise ValueError(f"h must be [B,T,{self.d_model}], got {tuple(h.shape)}")
 
+        if self.scale_by_sqrt_d:
+            h = h * (self.d_model ** -0.5)
+
         # Optional traceless pre-centering
         if traceless:
             h = _traceless_last(h)
@@ -173,6 +180,18 @@ class OutputHead(nn.Module):
             else:
                 W, b_ext = tied, None
 
+            if self.cast_device and W.device != h.device:
+                W = W.to(h.device)
+                if b_ext is not None:
+                    b_ext = b_ext.to(h.device)
+            if self.cast_dtype and W.dtype != h.dtype:
+                W = W.to(h.dtype)
+                if b_ext is not None:
+                    b_ext = b_ext.to(h.dtype)
+            W = W.contiguous()
+            if b_ext is not None:
+                b_ext = b_ext.contiguous()
+
             # Infer vocab size / create bias lazily if needed
             self._maybe_infer_vocab_and_bias(W)
 
@@ -184,7 +203,20 @@ class OutputHead(nn.Module):
                 logits = logits + self.bias  # type: ignore[operator]
 
         else:
-            logits = torch.matmul(h, self.weight.t()) + self.bias  # type: ignore[attr-defined]
+            weight = self.weight
+            bias = self.bias
+            if self.cast_device and weight.device != h.device:
+                weight = weight.to(h.device)
+                bias = bias.to(h.device)
+            if self.cast_dtype and weight.dtype != h.dtype:
+                weight = weight.to(h.dtype)
+                bias = bias.to(h.dtype)
+            logits = torch.matmul(h, weight.t()) + bias
+
+        if self.forbid_token_id is not None:
+            fid = int(self.forbid_token_id)
+            if fid < logits.size(-1):
+                logits[..., fid] = float("-inf")
 
         # Temperature
         temp = float(self.temperature if temperature is None else max(temperature, 1e-8))
@@ -236,5 +268,22 @@ if __name__ == "__main__":
     diff = (logits_t - logits_m).abs().max().item()
     print(f"[output_head] traceless max|Δ| = {diff:.2e}")
     assert diff < 1e-6
+
+    # 5) Casting dtype/device with bf16 (if available)
+    try:
+        W_fp32 = torch.randn(V, D, dtype=torch.float32)
+        h_bf16 = h.to(dtype=torch.bfloat16)
+        head_cast = OutputHead(vocab_size=None, d_model=D, tie_weight=True, get_tied=lambda: W_fp32, scale_by_sqrt_d=True)
+        logits_cast = head_cast(h_bf16)
+        print("[output_head] casting dtype/device with bf16 ok")
+    except Exception as e:
+        print("[output_head] skipping bf16 cast test (not supported on this device)")
+
+    # 6) forbid_token_id test
+    forbid_id = 3
+    head_forbid = OutputHead(vocab_size=V, d_model=D, tie_weight=False, forbid_token_id=forbid_id)
+    logits_forbid = head_forbid(h)
+    assert torch.all(torch.isinf(logits_forbid[..., forbid_id]) & (logits_forbid[..., forbid_id] < 0))
+    print("[output_head] forbid_token_id masking ok")
 
     print("[output_head] All good ✓")

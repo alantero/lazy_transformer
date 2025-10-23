@@ -70,23 +70,55 @@ def _pad1(x: Any, axis: int, left: int, right: int, bc: str, value: float = 0.0)
 # --------------------------- 1D / 2D Laplacians -----------------------------
 
 def apply_laplacian_1d(x: Any, *, axis: int = -1, h: float = 1.0,
-                       bc: str = "dirichlet") -> Any:
+                       bc: str = "dirichlet", causal: bool = False) -> Any:
     """
-    Discrete 1D Laplacian Δx ≈ (x[i-1] - 2x[i] + x[i+1]) / h^2 along `axis`.
-    bc ∈ {"dirichlet","neumann","periodic"}.
+    Discrete 1D Laplacian along `axis`.
+
+    - Non-causal (default, symmetric stencil):
+        Δx[i] ≈ (x[i-1] - 2x[i] + x[i+1]) / h^2
+        (uses one pad element on each side)
+    - Causal (left-sided, for temporal axes in autoregressive models):
+        Δ_causal x[i] ≈ (x[i] - 2x[i-1] + x[i-2]) / h^2
+        (pads only on the left; the output at position i does NOT depend on x[j] with j > i)
+
+    Parameters
+    ----------
+    x : array-like (NumPy or Torch)
+    axis : int
+        Axis over which to apply the Laplacian.
+    h : float
+        Grid spacing.
+    bc : {"dirichlet","neumann","periodic"}
+        Boundary condition used for padding. In `causal=True` mode, only left padding is applied.
+    causal : bool
+        If True, use the left-sided (strictly causal) second-difference stencil.
     """
-    if bc not in {"dirichlet", "neumann", "periodic"}:
-        raise ValueError("bc must be 'dirichlet', 'neumann', or 'periodic'")
-    xpad = _pad1(x, axis, 1, 1, bc, value=0.0)
-    left  = _take(xpad, slice(0, -2), axis)
-    mid   = _take(xpad, slice(1, -1), axis)
-    right = _take(xpad, slice(2, None), axis)
-    return (left - 2.0 * mid + right) / (h * h)
+    if causal:
+        # Left-sided (strictly causal) second difference:
+        # x[i] - 2*x[i-1] + x[i-2]
+        if bc not in {"dirichlet", "neumann", "periodic"}:
+            raise ValueError("bc must be 'dirichlet', 'neumann', or 'periodic'")
+        # Pad two values on the left, none on the right; this guarantees no lookahead.
+        xpad = _pad1(x, axis, 2, 0, bc, value=0.0)
+        xm2  = _take(xpad, slice(0, -2), axis)   # x[i-2]
+        xm1  = _take(xpad, slice(1, -1), axis)   # x[i-1]
+        xi   = _take(xpad, slice(2, None), axis) # x[i]
+        return (xi - 2.0 * xm1 + xm2) / (h * h)
+    else:
+        if bc not in {"dirichlet", "neumann", "periodic"}:
+            raise ValueError("bc must be 'dirichlet', 'neumann', or 'periodic'")
+        xpad = _pad1(x, axis, 1, 1, bc, value=0.0)
+        left  = _take(xpad, slice(0, -2), axis)
+        mid   = _take(xpad, slice(1, -1), axis)
+        right = _take(xpad, slice(2, None), axis)
+        return (left - 2.0 * mid + right) / (h * h)
 
 def apply_laplacian_2d(x: Any, *, axes: Tuple[int, int] = (-2, -1),
                        hx: float = 1.0, hy: float = 1.0,
                        bc: str = "dirichlet") -> Any:
-    """2D Laplacian: Δx ≈ (∂²/∂ax² + ∂²/∂ay²) using separable 1D stencils."""
+    """2D Laplacian: Δx ≈ (∂²/∂ax² + ∂²/∂ay²) using separable 1D stencils.
+    Note: If you need causal behaviour along one axis (e.g., time), call `apply_laplacian_1d(..., causal=True)` on that axis and add the spatial component separately.
+    """
     ax0, ax1 = axes
     l0 = apply_laplacian_1d(x, axis=ax0, h=hx, bc=bc)
     l1 = apply_laplacian_1d(x, axis=ax1, h=hy, bc=bc)
@@ -177,6 +209,22 @@ if __name__ == "__main__":
         err_1d_t = float(_torch.max(_torch.abs(Lf[1:-1] - 2.0)))
         print(f"  1D (Torch)  max interior error: {err_1d_t:.3e}")
         assert err_1d_t < 1e-6
+
+        # 1D causal: ensure output at i does not depend on future entries
+        g = _torch.zeros(16, dtype=_torch.float32)
+        g[:8] = 1.0
+        # Make a copy with a different future (positions > 9) to test no-lookahead
+        g_future = g.clone()
+        g_future[10:] = 123.0
+        Lc1 = apply_laplacian_1d(g, axis=0, h=1.0, bc="dirichlet", causal=True)
+        Lc2 = apply_laplacian_1d(g_future, axis=0, h=1.0, bc="dirichlet", causal=True)
+        # up to index 9 they must be identical (no dependency on >i)
+        assert _torch.allclose(Lc1[:10], Lc2[:10]), "Causal Laplacian leaked future information"
+        # And if we do modify x[9] itself (not just the future), the output at index 9 should change:
+        g_future2 = g.clone()
+        g_future2[9] = 123.0
+        Lc3 = apply_laplacian_1d(g_future2, axis=0, h=1.0, bc="dirichlet", causal=True)
+        assert not _torch.allclose(Lc1[9], Lc3[9]), "Causal Laplacian should depend on x[i] at the same index"
 
         # 2D
         H, W = 20, 24

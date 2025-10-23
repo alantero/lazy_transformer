@@ -60,6 +60,7 @@ class PortHamiltonianStep(nn.Module):
         use_diag_R: bool = True,
         traceless: bool = True,  # if True, apply groupwise traceless on input
         eps: float = 1e-6,
+        nonneg_R_scale: bool = True,
     ):
         super().__init__()
         if d <= 0:
@@ -74,6 +75,7 @@ class PortHamiltonianStep(nn.Module):
         self.use_diag_R = bool(use_diag_R)
         self.traceless = bool(traceless)
         self.eps = float(eps)
+        self.nonneg_R_scale = bool(nonneg_R_scale)
 
         # --- G: block-diagonal (groupwise) mixing, identity init ---
         W = torch.eye(self.cg).repeat(self.groups, 1, 1)     # [G, cg, cg]
@@ -106,7 +108,16 @@ class PortHamiltonianStep(nn.Module):
             nn.init.normal_(self.B, std=0.02)
         else:
             self.register_parameter("B", None)
-        self.R_scale = nn.Parameter(torch.tensor(0.0))       # lazy-minimal init
+        # Reparameterize R scale so it is non-negative (optional)
+        # Use a very negative init so the effective scale starts ~0 to preserve the "lazy-minimal" behavior.
+        self.R_logscale = nn.Parameter(torch.tensor(-20.0))  # softplus(-20) ~ 2e-9
+    def _R_scale(self) -> torch.Tensor:
+        if self.nonneg_R_scale:
+            # strictly non-negative scale with near-zero start
+            return F.softplus(self.R_logscale) + self.eps
+        else:
+            # fall back to raw (can be negative)
+            return self.R_logscale
 
     # ------------------------------- internals --------------------------------
 
@@ -133,7 +144,7 @@ class PortHamiltonianStep(nn.Module):
         if self.R_rank > 0:
             t = y @ self.B                                    # [N, r]
             out = out + t @ self.B.t()
-        return self.R_scale * out
+        return self._R_scale() * out
 
     # -------------------------------- forward ---------------------------------
 
@@ -186,7 +197,7 @@ if __name__ == "__main__":
         print(f"[portham] ||J+J^T||_∞ ≈ {sym_inf:.2e}")
         assert sym_inf < 1e-6
 
-        # Check R PSD: v^T R v >= 0 for random v (should be ≈0 with scale=0)
+        # Check R PSD: v^T R v >= 0 for random v (should be ≈0 with near-zero softplus scale)
         v = torch.randn(64, D)
         q = (v * step._apply_R(v)).sum(dim=1)
         print(f"[portham] R PSD min(q) ≈ {float(q.min().item()):.2e}")

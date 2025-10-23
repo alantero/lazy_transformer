@@ -58,6 +58,7 @@ def collate_batch(
     eos_id: Optional[int] = None,
     max_len: Optional[int] = None,
     clamp_left: bool = False,
+    return_xy: bool = False,
 ) -> Dict[str, Tensor]:
     """
     Collate variable-length token sequences to a padded batch.
@@ -68,12 +69,17 @@ def collate_batch(
       bos_id/eos_id: optional special tokens to prepend/append per sample
       max_len: if set, clamp sequences to this length
       clamp_left: if True and clamping is needed, keep the *right* part (recent tokens)
+      return_xy: if True, also return x, y, and mask_xy tensors aligned for next-token prediction (length T-1)
 
     Returns:
       dict with:
         tokens  [B, T] Long
         mask    [B, T] Bool (True for valid tokens)
         targets [B, T] Long (copy of tokens by default; shift is done in the loss)
+      If return_xy is True, also includes:
+        x       [B, T-1] Long (tokens input for next-token prediction)
+        y       [B, T-1] Long (target tokens shifted by one)
+        mask_xy [B, T-1] Bool (mask aligned with y)
     """
     proc = []
     for s in batch:
@@ -100,6 +106,13 @@ def collate_batch(
         "mask": mask,
         "targets": tokens.clone(),  # next-token shift happens downstream
     }
+    if return_xy:
+        x = tokens[:, :-1].contiguous()
+        y = tokens[:, 1:].contiguous()
+        mask_xy = mask[:, 1:].contiguous()  # targets are defined only where y exists
+        batch_out["x"] = x
+        batch_out["y"] = y
+        batch_out["mask_xy"] = mask_xy
     return batch_out
 
 
@@ -164,6 +177,30 @@ def build_collar_mask(
     return m
 
 
+def build_xy_from_tokens(batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    """
+    Given a batch dict containing 'tokens' and 'mask', compute the x, y, and mask_xy
+    tensors for next-token prediction.
+
+    Args:
+      batch: dict containing:
+        tokens [B, T] Long tensor of token ids
+        mask   [B, T] Bool tensor indicating valid tokens
+
+    Returns:
+      dict with:
+        x       [B, T-1] Long tensor (input tokens)
+        y       [B, T-1] Long tensor (target tokens shifted by one)
+        mask_xy [B, T-1] Bool tensor (mask aligned with y)
+    """
+    tokens = batch["tokens"]
+    mask = batch["mask"]
+    x = tokens[:, :-1].contiguous()
+    y = tokens[:, 1:].contiguous()
+    mask_xy = mask[:, 1:].contiguous()
+    return {"x": x, "y": y, "mask_xy": mask_xy}
+
+
 # ----------------------------- convenience API --------------------------------
 
 def make_dataloader(
@@ -177,6 +214,7 @@ def make_dataloader(
     eos_id: Optional[int] = None,
     max_len: Optional[int] = None,
     clamp_left: bool = False,
+    return_xy: bool = False,
 ) -> DataLoader:
     """
     Build a DataLoader over raw token sequences with our collate.
@@ -184,13 +222,16 @@ def make_dataloader(
     Returns batches shaped like collate_batch() plus 'collar_mask' (for the batch),
     which you can compute using build_collar_mask later given (W, O).
     We do not precompute collar here because (W, O) are model-config dependent.
+
+    If return_xy is True, the batch dict also includes 'x', 'y', and 'mask_xy'
+    tensors aligned for next-token prediction.
     """
     ds = SequenceDataset(sequences)
 
     def _collate(samples: List[List[int]]) -> Dict[str, Tensor]:
         batch = collate_batch(
             samples, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id,
-            max_len=max_len, clamp_left=clamp_left,
+            max_len=max_len, clamp_left=clamp_left, return_xy=return_xy,
         )
         return batch
 
@@ -233,5 +274,13 @@ if __name__ == "__main__":
     loader = make_dataloader(seqs, batch_size=2, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id)
     one = next(iter(loader))
     print(f"  loader: batch tokens shape={tuple(one['tokens'].shape)}")
+
+    # Test build_xy_from_tokens
+    xy = build_xy_from_tokens(batch)
+    x, y, mask_xy = xy["x"], xy["y"], xy["mask_xy"]
+    assert x.shape[1] + 1 == tokens.shape[1]
+    assert y.shape == x.shape
+    assert mask_xy.shape == x.shape
+    print(f"  xy: x/y shape={tuple(x.shape)} (from tokens T={T})")
 
     print("[dataloaders] All good ✓")

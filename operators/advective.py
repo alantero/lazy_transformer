@@ -21,6 +21,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 Tensor = torch.Tensor
 _BC = Literal["cycle", "path"]
@@ -39,11 +40,7 @@ class Advective1D(nn.Module):
       dx:     grid spacing (scalar float)
       learn_speed: if True, speed per group is a trainable Parameter; else it's a buffer
       speed_init: initial speed value (applied to all groups)
-
-    Forward:
-      x [B,T,D] → y [B,T,D], with groupwise speeds v_g:
-        y_g = v_g * ∂_t x_g
-      where ∂_t is approximated by the chosen FD scheme & boundary mode.
+      causal: if True, enforce strict causality (no access to x[:, t+1:]) by using a left-padded depthwise conv that implements a backward finite difference. Defaults to False to preserve existing numerical tests (periodic central differences).
     """
     def __init__(
         self,
@@ -55,6 +52,7 @@ class Advective1D(nn.Module):
         dx: float = 1.0,
         learn_speed: bool = True,
         speed_init: float = 0.0,
+        causal: bool = False,
     ):
         super().__init__()
         if d_model <= 0:
@@ -70,6 +68,7 @@ class Advective1D(nn.Module):
         self.scheme = scheme
         self.bc = bc
         self.dx = float(dx)
+        self.causal = bool(causal)
 
         # Groupwise speeds
         if learn_speed:
@@ -94,6 +93,27 @@ class Advective1D(nn.Module):
         else:
             self.speed.copy_(vec)
 
+    def _causal_backward_diff(self, x: Tensor) -> Tensor:
+        """
+        Compute causal (backward) finite difference using a depthwise 1D conv
+        implemented with left padding. Does NOT look at future indices.
+        x: [B, T, D]  -> returns diff: [B, T, D]
+        """
+        B, T, D = x.shape
+        # Conv1d expects [B, C, T]
+        xc = x.permute(0, 2, 1).contiguous()  # [B, D, T]
+        # Kernel for backward diff: [-1, 1] / dx, depthwise over D channels
+        weight = x.new_zeros((D, 1, 2))
+        weight[:, 0, 0] = -1.0 / self.dx
+        weight[:, 0, 1] = +1.0 / self.dx
+        bias = None
+        # Left pad by K-1 (=1) so that y[:, :, t] depends on x[:, :, :t]
+        xc_pad = F.pad(xc, (1, 0))  # (left, right)
+        # Depthwise conv: groups=D
+        diff = F.conv1d(xc_pad, weight, bias=bias, stride=1, padding=0, dilation=1, groups=D)
+        # back to [B, T, D]
+        return diff.permute(0, 2, 1).contiguous()
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Apply advective operator. x: [B,T,D] -> y: [B,T,D]
@@ -107,32 +127,39 @@ class Advective1D(nn.Module):
         # Reshape to [B,T,G,Cg] to broadcast group speeds over channels in the group
         xg = x.view(B, T, g, cg)
 
-        if self.scheme == "central":
-            if self.bc == "cycle":
-                right = torch.roll(xg, shifts=-1, dims=1)
-                left  = torch.roll(xg, shifts=+1, dims=1)
-                diff = (right - left) / (2.0 * self.dx)
-            else:  # 'path'
-                diff = torch.empty_like(xg)
-                diff[:, 1:-1, ...] = (xg[:, 2:, ...] - xg[:, :-2, ...]) / (2.0 * self.dx)
-                diff[:, 0,    ...] = (xg[:, 1,    ...] - xg[:, 0,     ...]) / self.dx
-                diff[:, -1,   ...] = (xg[:, -1,   ...] - xg[:, -2,    ...]) / self.dx
-
-        elif self.scheme == "upwind":
-            v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)
-            if self.bc == "cycle":
-                back = xg - torch.roll(xg, shifts=+1, dims=1)     # backward diff
-                fwd  = torch.roll(xg, shifts=-1, dims=1) - xg     # forward diff
-            else:  # 'path'
-                back = torch.empty_like(xg)
-                back[:, 1:, ...] = xg[:, 1:, ...] - xg[:, :-1, ...]
-                back[:, 0,  ...] = 0.0
-                fwd  = torch.empty_like(xg)
-                fwd[:, :-1, ...] = xg[:, 1:, ...] - xg[:, :-1, ...]
-                fwd[:, -1,  ...] = 0.0
-            diff = torch.where(v >= 0, back, fwd) / self.dx
+        # --- Causal fast-path: do not look at x[:, t+1:] ---
+        if self.causal:
+            # Use strictly backward finite differences (depthwise conv) along time
+            diff_full = self._causal_backward_diff(x)  # [B, T, D]
+            # reshape back to grouped view to apply groupwise speeds
+            diff = diff_full.view(B, T, g, cg)
         else:
-            raise ValueError("scheme must be 'central' or 'upwind'.")
+            if self.scheme == "central":
+                if self.bc == "cycle":
+                    right = torch.roll(xg, shifts=-1, dims=1)
+                    left  = torch.roll(xg, shifts=+1, dims=1)
+                    diff = (right - left) / (2.0 * self.dx)
+                else:  # 'path'
+                    diff = torch.empty_like(xg)
+                    diff[:, 1:-1, ...] = (xg[:, 2:, ...] - xg[:, :-2, ...]) / (2.0 * self.dx)
+                    diff[:, 0,    ...] = (xg[:, 1,    ...] - xg[:, 0,     ...]) / self.dx
+                    diff[:, -1,   ...] = (xg[:, -1,   ...] - xg[:, -2,    ...]) / self.dx
+
+            elif self.scheme == "upwind":
+                v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)
+                if self.bc == "cycle":
+                    back = xg - torch.roll(xg, shifts=+1, dims=1)     # backward diff
+                    fwd  = torch.roll(xg, shifts=-1, dims=1) - xg     # forward diff
+                else:  # 'path'
+                    back = torch.empty_like(xg)
+                    back[:, 1:, ...] = xg[:, 1:, ...] - xg[:, :-1, ...]
+                    back[:, 0,  ...] = 0.0
+                    fwd  = torch.empty_like(xg)
+                    fwd[:, :-1, ...] = xg[:, 1:, ...] - xg[:, :-1, ...]
+                    fwd[:, -1,  ...] = 0.0
+                diff = torch.where(v >= 0, back, fwd) / self.dx
+            else:
+                raise ValueError("scheme must be 'central' or 'upwind'.")
 
         # Multiply by group speeds (broadcast [1,1,G,1])
         v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)

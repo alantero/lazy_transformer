@@ -13,6 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 # ------------------------------ safe imports ----------------------------------
 # When executed as a script (python train/loop.py), make repo root importable.
@@ -76,7 +77,7 @@ class LoopConfig:
 
     # chebyshev filter
     cheb_deg: int = 8
-    cheb_laplacian: str = "cycle"  # 'cycle' (periodic) | 'path' (Dirichlet)
+    cheb_laplacian: str = "path"  # 'path' (Dirichlet, causal) | 'cycle' (periodic)
 
     # port-hamiltonian
     skew_rank: int = 16
@@ -153,6 +154,12 @@ class LoopConfig:
     profile: bool = False           # measure wall time per step and compute tokens/sec
     profile_nvtx: bool = False      # wrap steps in NVTX ranges (Nsight)
     profile_log_mem: bool = False   # log CUDA memory (allocated/reserved)
+
+    # debugging / diagnostics
+    debug_align: bool = False           # compute CE alignment diagnostics inside the model
+    debug_align_every: int = 200        # steps between debug logs (approx; model-side counter)
+    debug_state_norm: bool = False      # log hidden-state norm stats before head projection
+    debug_topk: int = 0                 # if >0, log top-k token ids/probs at the first debug step
 
 
 # ----------------------------------- model ------------------------------------
@@ -268,6 +275,13 @@ class ContinuousLM(nn.Module):
             temperature=1.0,
         )
 
+        # --- debug flags (cfg-only; set via arguments/config) ---
+        self._debug_align = bool(cfg.debug_align)
+        self._debug_align_every = int(max(1, cfg.debug_align_every))
+        self._debug_state_norm = bool(cfg.debug_state_norm)
+        self._debug_topk = int(max(0, cfg.debug_topk))
+        self._debug_step = 0
+
         # Stitching loss (optional)
         self.stitch = None
         if cfg.stitch_w > 0.0 and (cfg.stitch_use_skl or cfg.stitch_use_lowd):
@@ -323,11 +337,73 @@ class ContinuousLM(nn.Module):
         yr = reconstruct_from_windows(y_for_recon, n=T, W=W, O=O, axis=-2, window_fn="ones")
         return yr.permute(0, 2, 1).contiguous()     # [B, T, D]
 
+    @torch.no_grad()
+    def _maybe_debug_state(self, h_full: torch.Tensor, logits: torch.Tensor, tokens: Optional[torch.Tensor]) -> None:
+        if not self._debug_state_norm and not self._debug_align:
+            return
+        # step gating
+        do_log = False
+        if self.training:
+            do_log = (self._debug_step % self._debug_align_every) == 0
+            self._debug_step += 1
+        else:
+            # always log once in eval if enabled
+            do_log = True
+        if not do_log:
+            return
+
+        B, T, D = h_full.shape
+        _, _, V = logits.shape
+        device = h_full.device
+
+        if self._debug_state_norm:
+            # Norm of last hidden, and of all positions
+            h_last = h_full[:, -1, :]                  # [B, D]
+            n_last = torch.linalg.vector_norm(h_last, dim=-1)  # [B]
+            n_all = torch.linalg.vector_norm(h_full.reshape(B * T, D), dim=-1)  # [B*T]
+            mean_last = float(n_last.mean().item())
+            std_last = float(n_last.std(unbiased=False).item())
+            mean_all = float(n_all.mean().item())
+            std_all = float(n_all.std(unbiased=False).item())
+            logging.info(f"[debug] ||h_last|| mean={mean_last:.3f} std={std_last:.3f} | ||h|| mean={mean_all:.3f} std={std_all:.3f}")
+
+        if self._debug_align:
+            # Build canonical next-token targets from tokens if available, else from argmax teacher
+            if tokens is not None:
+                # shift: predict tokens[:,1:] from tokens[:, :-1]
+                if tokens.size(1) == logits.size(1):
+                    y = tokens
+                else:
+                    # if caller passed already-shifted inputs, fall back to zeros-safe
+                    y = tokens
+            else:
+                # fallback: use greedy teacher (only for debug)
+                y = logits.argmax(dim=-1)
+
+            # Three CE variants to catch off-by-one mishaps (no ignore_index here)
+            ce_full = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1), reduction="mean")
+            if T > 1:
+                ce_left = F.cross_entropy(logits[:, :-1, :].reshape(-1, V), y[:, :-1].reshape(-1), reduction="mean")
+                ce_right = F.cross_entropy(logits[:, 1:, :].reshape(-1, V), y[:, 1:].reshape(-1), reduction="mean")
+            else:
+                ce_left = ce_full
+                ce_right = ce_full
+            acc_full = float((logits.argmax(-1) == y).float().mean().item())
+            logging.info(f"[debug] CE(full)={float(ce_full.item()):.4f} | CE(<)={float(ce_left.item()):.4f} | CE(>)={float(ce_right.item()):.4f} | acc_full={acc_full:.3f}")
+
+            if self._debug_topk > 0:
+                # top-k of last position of sample 0
+                probs = F.softmax(logits[0, -1], dim=-1)
+                topk = min(self._debug_topk, V)
+                val, idx = torch.topk(probs, k=topk, dim=-1)
+                logging.info(f"[debug] top{topk}_ids(last@0)={idx.tolist()} | top{topk}_probs={val.tolist()}")
+
     def forward_tokens(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        tokens: [B,T] → logits: [B,T,V], y_win_bnwd: [B, n_win, W, D] (optional), logits_win: [B, n_win, W, V] (optional)
+        tokens: [B,T] → logits: [B,T,V], y_win_bnwd: [B, n_win, W, D], logits_win: [B, n_win, W, V] (optional)
         Consumes already-shifted inputs if the caller provides them (i.e., expects tokens and mask as given).
         """
+        tokens_for_debug = tokens
         h0 = self.embed(tokens)                             # [B,T,D]
         # Per-window processing
         xw, B, T, D, nwin = self._shape_windows(h0)
@@ -360,12 +436,15 @@ class ContinuousLM(nn.Module):
             # regular full-grad path
             y = self.block(xw)
 
-        # Keep windowed hidden for stitching loss if needed
-        y_win_bnwd = y.view(B, nwin, W, D)  # [B, n_win, W, D]
+        # Always return windowed hidden for masking/collar loss
+        y_win_bnwd = y.view(B, nwin, W, D)  # [B, nwin, W, D]
 
         h_full = self._unshape_and_reconstruct(y, B, T, D, nwin)  # [B,T,D]
         # Head (tied or learned). Keep logits unmasked here; CE handles ignore_index.
         logits = self.head(h_full, mask=None, mask_behavior="none", traceless=True)
+
+        # Debug: state norms and CE alignment (optional)
+        self._maybe_debug_state(h_full, logits, tokens_for_debug)
 
         # Prepare logits windows [B, n_win, W, V] for stitching if needed
         logits_win = None
@@ -373,7 +452,23 @@ class ContinuousLM(nn.Module):
             log_w = slice_windows(logits, self.cfg.W, self.cfg.O, axis=1, pad=True)  # [B, V, n_win, W]
             logits_win = log_w.permute(0, 2, 3, 1).contiguous()  # [B, n_win, W, V]
 
-        return logits, y_win_bnwd if (self.stitch is not None and self.cfg.stitch_use_lowd) else None, logits_win
+        return logits, y_win_bnwd, logits_win
+
+    def _build_collar_seq_mask(self, B: int, T: int, device, dtype=torch.bool):
+        """
+        Build a [B,T] boolean mask marking positions in the collar (first O and last O of each window).
+        """
+        W, O = self.cfg.W, self.cfg.O
+        base = torch.zeros(B, T, 1, device=device)
+        win = slice_windows(base, W, O, axis=1, pad=True)  # [B, 1, nwin, W]
+        mw = torch.zeros_like(win, dtype=torch.bool)
+        if O > 0:
+            mw[:, :, :, :O] = True
+            mw[:, :, :, W - O:] = True
+        # reconstruct to [B, 1, T]
+        mr = reconstruct_from_windows(mw, n=T, W=W, O=O, axis=-2, window_fn="ones")
+        # squeeze the singleton dim (1) to get [B, T]
+        return (mr > 0).squeeze(1)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -400,22 +495,43 @@ class ContinuousLM(nn.Module):
             B, T, V = logits.shape
             assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
 
-            loss = F.cross_entropy(
+            # Collar-only loss logic
+            use_collar_ce = self.training and self.cfg.grads_border_only and (self.cfg.O > 0) and (self.cfg.W > 2 * self.cfg.O)
+            # Build supervision mask: start from mask or all ones, AND with (y != pad_id)
+            if mask is not None:
+                sup_mask = mask.bool() & (y != pad_id)
+            else:
+                sup_mask = (y != pad_id)
+            if use_collar_ce:
+                collar_mask = self._build_collar_seq_mask(B, T, logits.device)
+                sup_mask = sup_mask & collar_mask
+            # Extra alignment check (masked fraction only as info)
+            if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
+                with torch.no_grad():
+                    used_frac = float(sup_mask.float().mean().item())
+                    logging.info(f"[debug] sup_mask used fraction={used_frac:.3f} (collar+valid)")
+            ce = F.cross_entropy(
                 logits.reshape(-1, V),
                 y.reshape(-1),
                 ignore_index=pad_id,
-                reduction="mean",
+                reduction="none",
             )
+            # Mask and normalize by count
+            ce_masked = ce.view(B, T)[sup_mask]
+            if ce_masked.numel() > 0:
+                loss = ce_masked.mean()
+            else:
+                loss = ce_masked.sum() * 0.0  # zero, keep grad
 
             with torch.no_grad():
                 pred = logits.argmax(dim=-1)
-                acc = (pred == y).float().mean().item()
+                acc = ((pred == y)[sup_mask].float().mean().item()) if sup_mask.any() else 0.0
 
             # Bits-per-token via helper (NLL path); aligned with y/mask
-            bpp_tensor, _ = bits_per_token(logits, targets=y, mask=mask, use_entropy=False, ignore_index=pad_id)
+            bpp_tensor, _ = bits_per_token(logits, targets=y, mask=sup_mask, use_entropy=False, ignore_index=pad_id)
             bpp_val = float(bpp_tensor.detach().item())
 
-            stats: Dict[str, float] = {"acc": acc, "bpp": bpp_val, "tokens": float(B * T)}
+            stats: Dict[str, float] = {"acc": acc, "bpp": bpp_val, "tokens": float(sup_mask.sum().item())}
 
         else:
             # Legacy path: accept 'tokens' and perform shift inside
@@ -432,21 +548,40 @@ class ContinuousLM(nn.Module):
             B, T, V = logits_s.shape
             assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
 
-            loss = F.cross_entropy(
+            use_collar_ce = self.training and self.cfg.grads_border_only and (self.cfg.O > 0) and (self.cfg.W > 2 * self.cfg.O)
+            # Build supervision mask: start from mask_s or all ones, AND with (targets_s != pad_id)
+            if mask_s is not None:
+                sup_mask = mask_s.bool() & (targets_s != pad_id)
+            else:
+                sup_mask = (targets_s != pad_id)
+            if use_collar_ce:
+                collar_mask = self._build_collar_seq_mask(B, T, logits_s.device)
+                sup_mask = sup_mask & collar_mask
+            # Extra alignment check (masked fraction only as info)
+            if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
+                with torch.no_grad():
+                    used_frac = float(sup_mask.float().mean().item())
+                    logging.info(f"[debug] sup_mask used fraction={used_frac:.3f} (collar+valid)")
+            ce = F.cross_entropy(
                 logits_s.reshape(-1, V),
                 targets_s.reshape(-1),
                 ignore_index=pad_id,
-                reduction="mean",
+                reduction="none",
             )
+            ce_masked = ce.view(B, T)[sup_mask]
+            if ce_masked.numel() > 0:
+                loss = ce_masked.mean()
+            else:
+                loss = ce_masked.sum() * 0.0
 
             with torch.no_grad():
                 pred = logits_s.argmax(dim=-1)
-                acc = (pred == targets_s).float().mean().item()
+                acc = ((pred == targets_s)[sup_mask].float().mean().item()) if sup_mask.any() else 0.0
 
-            bpp_tensor, _ = bits_per_token(logits_s, targets=targets_s, mask=mask_s, use_entropy=False, ignore_index=pad_id)
+            bpp_tensor, _ = bits_per_token(logits_s, targets=targets_s, mask=sup_mask, use_entropy=False, ignore_index=pad_id)
             bpp_val = float(bpp_tensor.detach().item())
 
-            stats = {"acc": acc, "bpp": bpp_val, "tokens": float(B * T)}
+            stats = {"acc": acc, "bpp": bpp_val, "tokens": float(sup_mask.sum().item())}
 
         # Optional stitching loss on overlaps (unchanged)
         if self.stitch is not None and (self.cfg.O > 0):
@@ -545,7 +680,7 @@ if __name__ == "__main__":
             cfg = LoopConfig(
                 W=16, O=4,
                 vocab_size=vocab.size, d_model=64, groups=8,
-                cheb_deg=6, cheb_laplacian="cycle",
+                cheb_deg=6, cheb_laplacian="path",
                 skew_rank=8, R_rank=4,
                 steps=2, dt=0.5, method="heun",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -564,7 +699,7 @@ if __name__ == "__main__":
             cfg = LoopConfig(
                 W=16, O=4,
                 vocab_size=vocab.size, d_model=64, groups=8,
-                cheb_deg=6, cheb_laplacian="cycle",
+                cheb_deg=6, cheb_laplacian="path",
                 skew_rank=8, R_rank=4,
                 steps=2, dt=0.5, method="heun",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
@@ -584,7 +719,7 @@ if __name__ == "__main__":
         cfg = LoopConfig(
             W=16, O=4,
             vocab_size=vocab.size, d_model=64, groups=8,
-            cheb_deg=6, cheb_laplacian="cycle",
+            cheb_deg=6, cheb_laplacian="path",
             skew_rank=8, R_rank=4,
             steps=2, dt=0.5, method="heun",
             tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",

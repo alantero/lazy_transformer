@@ -213,16 +213,23 @@ def build_npy_dataloaders(
 
     pw = bool(num_workers > 0)
     pf = 4 if num_workers > 0 else None
-    train_loader = DataLoader(
-        train_ds, batch_size=micro_batch_size, shuffle=shuffle_train, sampler=train_sampler,
+
+    train_kwargs = dict(
+        dataset=train_ds, batch_size=micro_batch_size, shuffle=shuffle_train, sampler=train_sampler,
         num_workers=num_workers, pin_memory=pin_memory, drop_last=drop_last, collate_fn=collate,
-        persistent_workers=pw, prefetch_factor=(pf if pf is not None else 2)
+        persistent_workers=pw,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=micro_batch_size, shuffle=False, sampler=val_sampler,
+    val_kwargs = dict(
+        dataset=val_ds, batch_size=micro_batch_size, shuffle=False, sampler=val_sampler,
         num_workers=num_workers, pin_memory=pin_memory, drop_last=False, collate_fn=collate,
-        persistent_workers=pw, prefetch_factor=(pf if pf is not None else 2)
+        persistent_workers=pw,
     )
+    if num_workers > 0:
+        train_kwargs["prefetch_factor"] = pf
+        val_kwargs["prefetch_factor"] = pf
+
+    train_loader = DataLoader(**train_kwargs)
+    val_loader   = DataLoader(**val_kwargs)
     logging.info(f"[data] train {tuple(train_ds.arr.shape)}  val {tuple(val_ds.arr.shape)}  seq_len={seq_len} | workers={num_workers} persistent={pw} prefetch={pf or 'default'}")
     return train_loader, val_loader, seq_len
 
@@ -482,6 +489,28 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Run validation every N steps (0 disables periodic validation). Best checkpoint is selected by val_loss when validation runs.")
     p.add_argument("--debug-sanity", action="store_true",
                help="Run one-time sanity checks on targets/tokens alignment and pad usage before training.")
+
+    # --- AR/diagnostic controls (propagated to LoopConfig) ---
+    p.add_argument("--grads-border-only", dest="grads_border_only", action="store_true",
+                  help="Backprop only on the collar/border region (windowed training).")
+    p.add_argument("--no-grads-border-only", dest="grads_border_only", action="store_false",
+                  help="Disable border-only grads; compute CE on all positions.")
+    p.set_defaults(grads_border_only=None)
+
+    p.add_argument("--debug-align", action="store_true",
+                  help="Run strict autoregressive alignment diagnostics during training.")
+    p.add_argument("--debug-align-every", type=int, default=None,
+                  help="Frequency (in steps) for alignment debug logs.")
+    p.add_argument("--debug-state-norm", action="store_true",
+                  help="Log state norms (e.g., ||h|| and ||h_last||).")
+    p.add_argument("--debug-topk", type=int, default=None,
+                  help="If set, log top-k token ids/probs at last timestep during training.")
+
+    # Optional override for Chebyshev laplacian kind
+    p.add_argument("--cheb-laplacian", dest="cheb_laplacian", type=str, default=None,
+                  choices=["path", "cycle", "toeplitz"],
+                  help="Laplacian kind used by Chebyshev operator. Use 'path' for causal LM.")
+
     return p
 @torch.no_grad()
 def evaluate_val_ce(model: torch.nn.Module, val_loader: DataLoader, pad_id: int) -> Dict[str, float]:
@@ -597,6 +626,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         "checkpoint_dir": args.checkpoint_dir, "save_every": args.save_every,
         "keep_last_k": args.keep_last_k, "resume_path": args.resume_path,
         "profile": args.profile, "profile_nvtx": args.profile_nvtx, "profile_log_mem": args.profile_log_mem,
+        "grads_border_only": args.grads_border_only,
+        "debug_align": getattr(args, "debug_align", None),
+        "debug_align_every": getattr(args, "debug_align_every", None),
+        "debug_state_norm": getattr(args, "debug_state_norm", None),
+        "debug_topk": getattr(args, "debug_topk", None),
+        "cheb_laplacian": getattr(args, "cheb_laplacian", None),
     }
     # HF config merge (preset -> HF -> CLI). YAML is optional and not used here.
     #hf_dict = {}
@@ -879,7 +914,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         model.eval()
         with torch.no_grad():
             ref = last_batch if last_batch is not None else next(iter(val_loader))
-            logits = model.forward_tokens(ref["x"], ref.get("mask", None))
+            out = model.forward_tokens(ref["x"], ref.get("mask", None))
+            logits = out[0] if isinstance(out, (tuple, list)) else out
             B, T, V = logits.shape
             print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
 
@@ -1045,7 +1081,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     model.eval()
     with torch.no_grad():
-        logits = model.forward_tokens(batch.get("tokens", batch.get("x")), batch.get("mask", None))
+        out = model.forward_tokens(batch.get("tokens", batch.get("x")), batch.get("mask", None))
+        logits = out[0] if isinstance(out, (tuple, list)) else out
         B, T, V = logits.shape
         print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
 

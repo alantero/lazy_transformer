@@ -1,5 +1,5 @@
 # operators/cheb.py
-# Chebyshev polynomial filters over a 1D Laplacian (time axis).
+# Chebyshev polynomial filters over a 1D (causal) Laplacian on the time axis.
 # Adds: (1) per-group learnable coeffs in Torch, (2) laplacian="path" (Dirichlet BC).
 # NumPy/Torch compatible; no external project deps.
 
@@ -128,20 +128,29 @@ def heat_cheb_coeffs(K: int, tau: float, lmax: float = 2.0) -> "_np.ndarray":
 
 # -------------------------- Chebyshev filtering -------------------------------
 
-def _select_Lx(laplacian: str):
-    if laplacian == "cycle":
-        return _lap_cycle
+def _select_Lx(laplacian: str, *, allow_noncausal: bool = False):
+    # 'path' is causal (Dirichlet BC). 'cycle' is non-causal (wrap-around).
     if laplacian == "path":
         return _lap_path_dirichlet
-    raise ValueError(f"Unsupported laplacian='{laplacian}'. Use 'cycle' or 'path'.")
+    if laplacian == "cycle":
+        if not allow_noncausal:
+            raise ValueError(
+                "laplacian='cycle' is non-causal (wrap-around) and is disallowed by default. "
+                "Use laplacian='path' for language modeling, or pass allow_noncausal=True where supported."
+            )
+        return _lap_cycle
+    raise ValueError(f"Unsupported laplacian='{laplacian}'. Use 'path' (causal) or 'cycle' (non-causal).")
+def _cast_like_tensor(t: _torch.Tensor, ref: _torch.Tensor) -> _torch.Tensor:
+    return t.to(dtype=ref.dtype, device=ref.device)
 
 def cheb_apply(
     x: Any,
     coeffs: Sequence[float],
     *,
-    laplacian: str = "cycle",
+    laplacian: str = "path",
     axis_time: int = -2,
     lmax: float = 2.0,
+    allow_noncausal: bool = False,
 ) -> Any:
     """
     NumPy/Torch (shared-coeff) Chebyshev filter:
@@ -152,7 +161,7 @@ def cheb_apply(
     if K < 0:
         raise ValueError("coeffs must be non-empty.")
 
-    Lx = _select_Lx(laplacian)
+    Lx = _select_Lx(laplacian, allow_noncausal=allow_noncausal)
     mu = lambda v: _mu_apply(Lx, v, lmax=lmax)
 
     t0 = x
@@ -185,9 +194,10 @@ def cheb_apply_torch_groupwise(
     coeffs: _torch.Tensor,          # shape [K+1] or [G, K+1]
     *,
     groups: int = 1,
-    laplacian: str = "cycle",
+    laplacian: str = "path",
     axis_time: int = -2,
     lmax: float = 2.0,
+    allow_noncausal: bool = False,
 ) -> _torch.Tensor:
     """
     Torch Chebyshev filter with optional per-group coeffs:
@@ -197,12 +207,14 @@ def cheb_apply_torch_groupwise(
     if axis_time != -2:
         # Keep behavior parity with cheb_apply by moving the axis
         x = _move_axis(x, axis_time, -2)
-        y = cheb_apply_torch_groupwise(x, coeffs, groups=groups, laplacian=laplacian, axis_time=-2, lmax=lmax)
+        y = cheb_apply_torch_groupwise(
+            x, coeffs, groups=groups, laplacian=laplacian, axis_time=-2, lmax=lmax, allow_noncausal=allow_noncausal
+        )
         return _move_axis(y, -2, axis_time)
 
     if coeffs.ndim == 1:
         # Shared coefficients → fall back to scalar version
-        return cheb_apply(x, coeffs.tolist(), laplacian=laplacian, axis_time=axis_time, lmax=lmax)
+        return cheb_apply(x, coeffs.tolist(), laplacian=laplacian, axis_time=axis_time, lmax=lmax, allow_noncausal=allow_noncausal)
 
     # Groupwise coefficients
     if x.shape[-1] % groups != 0:
@@ -211,7 +223,10 @@ def cheb_apply_torch_groupwise(
     if G != groups:
         raise ValueError(f"coeffs has G={G} but groups={groups}.")
 
-    Lx = _select_Lx(laplacian)
+    # Ensure coeffs matches input dtype/device
+    coeffs = _cast_like_tensor(coeffs, x)
+
+    Lx = _select_Lx(laplacian, allow_noncausal=allow_noncausal)
     mu = lambda v: _mu_apply(Lx, v, lmax=lmax)
 
     K = coeffs.shape[1] - 1
@@ -256,9 +271,11 @@ if _HAVE_TORCH:
             *,
             groups: int = 1,
             lmax: float = 2.0,
-            laplacian: str = "cycle",
+            laplacian: str = "path",
             learnable: bool = True,
+            allow_noncausal: bool = False,
         ):
+            self.allow_noncausal = bool(allow_noncausal)
             super().__init__()
             if K < 0:
                 raise ValueError("K must be >= 0.")
@@ -290,9 +307,14 @@ if _HAVE_TORCH:
         def forward(self, x: _torch.Tensor, *, axis_time: int = -2) -> _torch.Tensor:
             # If shared coeffs (shape [1,K+1]), broadcast as scalar version
             if self.coeffs.shape[0] == 1 and self.groups == 1:
-                return cheb_apply(x, self.coeffs[0].tolist(), laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax)
+                return cheb_apply(
+                    x, self.coeffs[0].tolist(),
+                    laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax,
+                    allow_noncausal=self.allow_noncausal
+                )
             return cheb_apply_torch_groupwise(
-                x, self.coeffs, groups=self.groups, laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax
+                x, self.coeffs, groups=self.groups, laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax,
+                allow_noncausal=self.allow_noncausal
             )
 else:
     class ChebFilter1D:
@@ -307,7 +329,7 @@ else:
             *,
             tau: float = 0.5,
             lmax: float = 2.0,
-            laplacian: str = "cycle",
+            laplacian: str = "path",
         ):
             if _np is None:
                 raise ImportError("NumPy is required in the no-Torch version.")
@@ -345,27 +367,26 @@ if __name__ == "__main__":
             raise RuntimeError("NumPy needed to synthesize heat init for this demo.")
         K = 8
         coeff_heat = _torch.tensor(heat_cheb_coeffs(K, tau=0.8, lmax=2.0), dtype=_torch.float32, device=device)
-        filt = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=2.0, laplacian="cycle", learnable=False).to(device)
+        filt = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=4.0, laplacian="path", learnable=False).to(device)
         y = filt(x)
 
         X = _torch.fft.rfft(x[..., 0], dim=-1)  # take one channel
         Y = _torch.fft.rfft(y[..., 0], dim=-1)
         gain_low = float((Y.abs()[0, low_bin] / (X.abs()[0, low_bin] + 1e-12)).item())
         gain_high = float((Y.abs()[0, high_bin] / (X.abs()[0, high_bin] + 1e-12)).item())
-        print(f"  Torch (cycle): low≈{gain_low:.3f}, high≈{gain_high:.3f}")
+        print(f"  Torch (path):  low≈{gain_low:.3f}, high≈{gain_high:.3f}")
         assert gain_low > gain_high + 0.1
 
-        # Also exercise 'path' Laplacian
-        filt_path = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=4.0, laplacian="path", learnable=False).to(device)
-        y2 = filt_path(x)
-        Y2 = _torch.fft.rfft(y2[..., 0], dim=-1)
-        gain_low2 = float((Y2.abs()[0, low_bin] / (X.abs()[0, low_bin] + 1e-12)).item())
-        gain_high2 = float((Y2.abs()[0, high_bin] / (X.abs()[0, high_bin] + 1e-12)).item())
-        print(f"  Torch (path):  low≈{gain_low2:.3f}, high≈{gain_high2:.3f}")
-        assert gain_low2 > gain_high2 + 0.1
+        # Optionally, exercise 'cycle' Laplacian (non-causal) if allowed
+        try:
+            filt_cycle = ChebFilter1D(K=K, coeffs=coeff_heat, groups=1, lmax=2.0, laplacian="cycle", learnable=False, allow_noncausal=True).to(device)
+            y_nc = filt_cycle(x); _ = y_nc.shape  # shape check only
+            print("  Torch (cycle): non-causal path exercised (wrap-around) ✓")
+        except Exception as e:
+            print(f"  Torch (cycle) skipped: {e}")
 
         # Finally, instantiate a *groupwise* learnable bank (random init) just to check shapes.
-        bank = ChebFilter1D(K=K, coeffs=None, groups=4, lmax=2.0, laplacian="cycle", learnable=True).to(device)
+        bank = ChebFilter1D(K=K, coeffs=None, groups=4, lmax=2.0, laplacian="cycle", learnable=True, allow_noncausal=True).to(device)
         yb = bank(x)  # shape check
         assert yb.shape == x.shape
 
@@ -376,24 +397,23 @@ if __name__ == "__main__":
         x = (sig_low + sig_high).reshape(1, T, 1).repeat(D, axis=-1)  # [1,T,D]
 
         K = 8
-        filt = ChebFilter1D(K=K, tau=0.8, lmax=2.0, laplacian="cycle")
+        filt = ChebFilter1D(K=K, tau=0.8, lmax=4.0, laplacian="path")
         y = filt(x)
 
         X = _np.fft.rfft(x[..., 0], axis=-1)
         Y = _np.fft.rfft(y[..., 0], axis=-1)
         gain_low = float(_np.abs(Y[0, low_bin]) / (_np.abs(X[0, low_bin]) + 1e-12))
         gain_high = float(_np.abs(Y[0, high_bin]) / (_np.abs(X[0, high_bin]) + 1e-12))
-        print(f"  NumPy (cycle): low≈{gain_low:.3f}, high≈{gain_high:.3f}")
+        print(f"  NumPy (path):  low≈{gain_low:.3f}, high≈{gain_high:.3f}")
         assert gain_low > gain_high + 0.1
 
-        # path (Dirichlet) with lmax≈4
-        filt_path = ChebFilter1D(K=K, tau=0.8, lmax=4.0, laplacian="path")
-        y2 = filt_path(x)
-        Y2 = _np.fft.rfft(y2[..., 0], axis=-1)
-        gain_low2 = float(_np.abs(Y2[0, low_bin]) / (_np.abs(X[0, low_bin]) + 1e-12))
-        gain_high2 = float(_np.abs(Y2[0, high_bin]) / (_np.abs(X[0, high_bin]) + 1e-12))
-        print(f"  NumPy (path):  low≈{gain_low2:.3f}, high≈{gain_high2:.3f}")
-        assert gain_low2 > gain_high2 + 0.1
+        # Optionally, exercise 'cycle' Laplacian (non-causal) if allowed
+        try:
+            filt_cycle = ChebFilter1D(K=K, tau=0.8, lmax=2.0, laplacian="cycle")
+            y_nc = filt_cycle(x); _ = y_nc.shape  # shape check only
+            print("  NumPy (cycle): non-causal path exercised (wrap-around) ✓")
+        except Exception as e:
+            print(f"  NumPy (cycle) skipped: {e}")
     else:
         raise RuntimeError("Neither NumPy nor Torch is available.")
 

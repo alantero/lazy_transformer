@@ -130,28 +130,38 @@ class Integrator(nn.Module):
         B, T, D = h.shape
         y = h.view(B * T, D)  # flatten for last-dim linear ops
 
+        # Resolve dissipative scale in a way that is compatible with PortHamiltonianStep
+        if hasattr(f, "_R_scale") and callable(getattr(f, "_R_scale")):
+            _rs = f._R_scale()
+            if torch.is_tensor(_rs):
+                R_scale = float(_rs.detach().float().item())
+            else:
+                R_scale = float(_rs)
+        elif hasattr(f, "R_scale"):
+            _rs = getattr(f, "R_scale")
+            R_scale = float(_rs.detach().float().item()) if torch.is_tensor(_rs) else float(_rs)
+        else:
+            R_scale = 1.0
+
         # (i) Pre-mix with G
         y = f._apply_G(y)
 
         # (i-a) ETD for R: try exact diagonal exp if available
-        # Diagonal part: rho -> softplus -> diag; scale by R_scale if present.
-        R_scale = float(getattr(f, "R_scale", torch.tensor(1.0)).detach().float().item()) \
-                  if hasattr(f, "R_scale") else 1.0
         used_exact_diag = False
         if getattr(f, "use_diag_R", False) and hasattr(f, "rho"):
             diag = F.softplus(getattr(f, "rho"))  # [D]
-            if diag.shape == (D,):
+            if torch.is_tensor(diag) and diag.dim() == 1 and diag.numel() == D:
                 s = torch.exp(-dt * R_scale * (diag + getattr(f, "eps", 0.0)))
                 y = y * s  # exact ETD for diag
                 used_exact_diag = True
 
-        # (i-b) Low-rank part (if any): first-order ETD correction (optional)
-        # Note: exact exp for low-rank would use matrix identity; we keep a stable 1st-order term.
-        if hasattr(f, "R_rank") and getattr(f, "R_rank") and hasattr(f, "B") and getattr(f, "B") is not None:
-            y = y - dt * R_scale * ( (y @ f.B) @ f.B.t() )
-
-        # If no diag info, fall back to explicit dissipative Euler for stability
-        if not used_exact_diag:
+        # (i-b) Low-rank part:
+        # If we used the exact diagonal, add only the low-rank correction explicitly.
+        # Otherwise, fall back to the full _apply_R which already includes all parts.
+        if used_exact_diag and hasattr(f, "R_rank") and getattr(f, "R_rank") and hasattr(f, "B") and getattr(f, "B") is not None:
+            y = y - dt * R_scale * ((y @ f.B) @ f.B.t())
+        elif not used_exact_diag:
+            # Full dissipative Euler fallback (covers diag + low-rank consistently)
             y = y - dt * f._apply_R(y)
 
         # (ii) Skew step via midpoint/leapfrog (symplectic for linear skew flows)
@@ -264,6 +274,12 @@ if __name__ == "__main__":
     try:
         from modules.portham import PortHamiltonianStep
         step = PortHamiltonianStep(d=D, groups=4, skew_rank=16, R_rank=4, traceless=True)
+
+        # Guard: ensure integrator can read R scale via the new helper
+        if hasattr(step, "_R_scale"):
+            _rs = step._R_scale()
+            assert isinstance(_rs, (float, torch.Tensor)), "PortHamiltonianStep._R_scale should return float or Tensor"
+
         h0 = torch.randn(B, T, D)
 
         # Heun: with J_scale=R_scale=0, derivative ~0

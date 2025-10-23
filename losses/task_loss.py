@@ -14,6 +14,17 @@ import torch.nn.functional as F
 
 Tensor = torch.Tensor
 
+import math
+
+__all__ = [
+    "shift_for_next_token",
+    "sequence_cross_entropy",
+    "sequence_ce_with_distillation",
+    "perplexity",
+    "token_accuracy",
+    "sequence_cross_entropy_autoregressive",
+]
+
 
 # ------------------------------ small helpers --------------------------------
 
@@ -51,6 +62,7 @@ def _flatten_for_loss(logits: Tensor, targets: Tensor) -> Tuple[Tensor, Tensor]:
     return logits.reshape(B * T, V), targets.reshape(B * T)
 
 
+
 def _valid_mask_like(targets: Tensor, mask: Optional[Tensor], ignore_index: Optional[int]) -> Tensor:
     """Build a boolean mask over [B,T] for valid tokens."""
     if mask is None:
@@ -60,6 +72,33 @@ def _valid_mask_like(targets: Tensor, mask: Optional[Tensor], ignore_index: Opti
     if ignore_index is not None:
         valid = valid & (targets != ignore_index)
     return valid
+
+
+# Collar mask helper
+def _apply_collar_time_mask(mask: Optional[Tensor], T: int, left: int = 0, right: int = 0, device=None) -> Optional[Tensor]:
+    """
+    Optionally zero-out (ignore) the first `left` and last `right` time positions for CE.
+    If `mask` is given, it is AND-ed with the collar mask.
+    Shapes:
+      mask: [B, T] or None
+    Returns:
+      [B, T] or None
+    """
+    if (left <= 0) and (right <= 0):
+        return mask
+    if device is None and mask is not None:
+        device = mask.device
+    B = None if mask is None else mask.shape[0]
+    collar = torch.ones((B if B is not None else 1, T), dtype=torch.bool, device=device)
+    if left > 0:
+        collar[:, :min(left, T)] = False
+    if right > 0:
+        collar[:, max(T - right, 0):] = False
+    if mask is None:
+        return collar
+    return mask.to(torch.bool) & collar
+# ------------------------------- convenience ---------------------------------
+# ----------------------------------- __main__ ---------------------------------
 
 
 # ------------------------------- main losses ---------------------------------
@@ -287,6 +326,56 @@ def token_accuracy(
         return float(correct / total)
 
 
+# ------------------------------- autoregressive CE wrapper --------------------
+
+def sequence_cross_entropy_autoregressive(
+    logits: Tensor,
+    targets: Tensor,
+    *,
+    mask: Optional[Tensor] = None,
+    ignore_index: Optional[int] = None,
+    label_smoothing: float = 0.0,
+    reduction: str = "mean",
+    topk: int = 5,
+    collar: Optional[Tuple[int, int]] = None,
+    bpp: bool = True,
+    h_prev: Optional[Tensor] = None,
+    h_next: Optional[Tensor] = None,
+) -> Tuple[Tensor, Dict[str, float]]:
+    """
+    Strict autoregressive CE:
+      - Shifts to (logits[:, :-1], targets[:, 1:]) internally.
+      - Applies optional time-collar on the CE mask (not on the forward).
+      - Reports CE, acc, acc@k, tokens, and (optionally) bits-per-token.
+    """
+    if logits.dim() != 3 or targets.dim() != 2:
+        raise ValueError("logits must be [B,T,V] and targets [B,T].")
+    B, T, V = logits.shape
+    if targets.shape[:2] != (B, T):
+        raise ValueError("targets must match logits on (B,T).")
+    # shift
+    logits_s, targets_s, mask_s = shift_for_next_token(logits, targets, mask=mask)
+    # optional collar on CE only
+    if collar is not None:
+        left, right = int(collar[0]), int(collar[1])
+        mask_s = _apply_collar_time_mask(mask_s, T - 1, left=left, right=right, device=(mask_s.device if mask_s is not None else logits.device))
+    # delegate to base CE
+    loss, stats = sequence_cross_entropy(
+        logits_s, targets_s,
+        mask=mask_s, ignore_index=ignore_index,
+        label_smoothing=label_smoothing, reduction=reduction,
+        h_prev=h_prev, h_next=h_next, topk=topk,
+    )
+    if bpp:
+        # CE is in nats; convert to bits/token
+        try:
+            ce_mean = float(stats["ce"])
+            stats["bpp"] = ce_mean / math.log(2)
+        except Exception:
+            pass
+    return loss, stats
+
+
 # ----------------------------------- __main__ ---------------------------------
 
 if __name__ == "__main__":
@@ -353,3 +442,10 @@ if __name__ == "__main__":
     print(f"[task_loss] token_accuracy: top1={acc1:.3f}, top5={acc5:.3f}")
 
     print("[task_loss] All good ✓")
+
+    # 7) Autoregressive wrapper with collar and bpp
+    loss_ar, st_ar = sequence_cross_entropy_autoregressive(
+        logits, targets, mask=mask, ignore_index=pad_id, label_smoothing=0.0, topk=5, collar=(1, 1)
+    )
+    print(f"[task_loss] AR CE mean={loss_ar.item():.6f}, bpp={st_ar.get('bpp', 0.0):.3f}, acc@1={st_ar['acc']:.3f}")
+

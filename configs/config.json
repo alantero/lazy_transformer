@@ -7,7 +7,7 @@
   "groups": 16,
 
   "cheb_deg": 8,
-  "cheb_laplacian": "cycle",
+  "cheb_laplacian": "path",
   "skew_rank": 8,
   "R_rank": 4,
 
@@ -37,9 +37,15 @@
   "profile": false,
   "profile_nvtx": false,
   "profile_log_mem": false,
+  "debug_align": true,
+  "debug_align_every": 500,
+  "debug_state_norm": true,
+  "debug_topk": 10,
 
   "checkpoint_dir": "ckpts/clo30m_owt",
   "save_every": 50,
   "keep_last_k": 5,
-  "best_metric_name": "loss"
+  "best_metric_name": "loss",
+
+  "grads_border_only": false
 }

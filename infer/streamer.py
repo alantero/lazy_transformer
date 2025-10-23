@@ -193,6 +193,10 @@ class StreamerConfig:
     cap_threshold: float = 0.15               # capacity ~ 1 - H/log(V); lower → less confident
     keep_collar_on_teleport: bool = True      # keep last O tokens as collar when teleporting
 
+    # debugging
+    debug_topk: bool = False           # if True, print top-10 tokens at the last position
+    debug_topk_all: bool = False       # if True, print at every step; otherwise only first step
+
     # misc
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     pad_id: int = 0
@@ -279,6 +283,11 @@ class Streamer:
         m = mask if mask is not None else torch.ones_like(tokens, dtype=torch.bool, device=device)
         # Keep a copy of the full, untrimmed prompt for decoding and repetition history
         prompt_tokens_full = tokens.clone()
+        # Per-batch repetition histories (tail of prompt) and alive mask (for EOS stop)
+        hist_ids: List[List[int]] = [
+            prompt_tokens_full[b].tolist()[-int(self.cfg.W + self.cfg.O):] for b in range(B)
+        ]
+        alive = torch.ones(B, dtype=torch.bool, device=device)
         out_new: List[Tensor] = []
         teleports = 0
         self._ent_hist.clear()
@@ -296,15 +305,30 @@ class Streamer:
             Hn = (H / math.log(float(V))).mean().item()    # normalized entropy in [0,1] approx
             cap = max(0.0, 1.0 - Hn)                       # capacity proxy
 
-            # Build history from the tail of the original prompt plus generated ids so far
-            # Note: apply the same prompt tail for each item in batch (typical single-sample usage).
-            history_ids: List[int] = prompt_tokens_full[0].tolist()[-int(self.cfg.W + self.cfg.O):]
-            for t in out_new:
-                history_ids.extend(t.tolist())
+            # Optional debug: show top-10 tokens/probs at the last position (sample 0)
+            if getattr(self.cfg, "debug_topk", False) and ((self._accepted == 0) or getattr(self.cfg, "debug_topk_all", False)):
+                 with torch.no_grad():
+                      probs_dbg = torch.softmax(last, dim=-1)
+                      k = int(min(10, V))
+                      topk_dbg = torch.topk(probs_dbg, k=k, dim=-1)
+                      ids_dbg = topk_dbg.indices[0].tolist()
+                      vals_dbg = [float(v) for v in topk_dbg.values[0]]
+                      argmax_id = int(torch.argmax(last[0]).item())
+                      step_idx = int(self._accepted // max(1, tokens.size(0)))
+                      logit_range = float((last[0].max() - last[0].min()).item())
+                      logit_l2 = float(last[0].norm(p=2).item())
+                      print(f"[debug] step={step_idx} top{k}_ids(sample0)=", ids_dbg)
+                      print(f"[debug] step={step_idx} top{k}_probs(sample0)=", vals_dbg)
+                      print(f"[debug] step={step_idx} argmax_id(sample0)=", argmax_id, "| logit_range=", logit_range, "| logit_l2=", logit_l2)
 
-            # Repetition penalty & n-gram blocking
-            last = apply_repetition_penalty(last, history_ids, self.cfg.repetition_penalty, window=self.cfg.W + self.cfg.O)
-            last = block_repeated_ngrams(last, history_ids, self.cfg.no_repeat_ngram_size, V, window=self.cfg.W + self.cfg.O)
+
+            # Repetition penalty & n-gram blocking — apply per batch using each sample's history
+            for b in range(B):
+                lb = last[b:b+1]
+                hb = hist_ids[b]
+                lb = apply_repetition_penalty(lb, hb, self.cfg.repetition_penalty, window=self.cfg.W + self.cfg.O)
+                lb = block_repeated_ngrams(lb, hb, self.cfg.no_repeat_ngram_size, V, window=self.cfg.W + self.cfg.O)
+                last[b:b+1] = lb
 
             # Method-specific filtering + sampling pipeline
             # Order (HF-style): temperature -> typical (optional) -> min-p -> top-k/top-p -> sample/greedy
@@ -312,6 +336,13 @@ class Streamer:
                 # Greedy does not use temperature or stochastic filters
                 z = last
                 next_ids = torch.argmax(z, dim=-1)
+                # Update per-batch histories with the newly chosen ids (only for alive samples)
+                for b in range(B):
+                    if bool(alive[b]):
+                        hist_ids[b].append(int(next_ids[b].item()))
+                        # Keep only a bounded tail to avoid unbounded growth
+                        if len(hist_ids[b]) > int(self.cfg.W + self.cfg.O) * 4:
+                            hist_ids[b] = hist_ids[b][-int(self.cfg.W + self.cfg.O):]
             else:
                 # 1) Temperature
                 z = last / float(max(self.cfg.temperature, 1e-8))
@@ -325,6 +356,13 @@ class Streamer:
                 # 5) Sample
                 p = torch.softmax(z, dim=-1)
                 next_ids = torch.multinomial(p, num_samples=1).squeeze(-1)
+                # Update per-batch histories with the newly chosen ids (only for alive samples)
+                for b in range(B):
+                    if bool(alive[b]):
+                        hist_ids[b].append(int(next_ids[b].item()))
+                        # Keep only a bounded tail to avoid unbounded growth
+                        if len(hist_ids[b]) > int(self.cfg.W + self.cfg.O) * 4:
+                            hist_ids[b] = hist_ids[b][-int(self.cfg.W + self.cfg.O):]
             tokens, m = _append_tokens(tokens, m, next_ids)
             tokens, m = _trim_to_window(tokens, m, self.cfg.W)
             out_new.append(next_ids)
@@ -340,25 +378,18 @@ class Streamer:
                 stopped_opt = True
                 break
 
-            # EOS stop (optional)
+            # EOS stop per-sample (for B>1 keep generating for unfinished samples)
             if self.cfg.eos_id is not None:
-                if bool((next_ids == int(self.cfg.eos_id)).all().item()):
+                eos_tensor = torch.tensor(int(self.cfg.eos_id), device=device, dtype=next_ids.dtype)
+                alive = alive & (next_ids != eos_tensor)
+                if not bool(alive.any().item()):
                     break
 
         # concat outputs
         if out_new:
-            add = torch.stack(out_new, dim=1)  # [B,N]
-            out_tokens = torch.cat([tokens[:, :tokens.size(1) - add.size(1)], add], dim=1) if tokens.size(1) > add.size(1) else torch.cat([tokens[:, :0], add], dim=1)
-            # Reconstruct full stream by reusing the already-trimmed tokens as final state:
-            # For users: return the original prompt concatenated with generated tokens only
-            gen_only = add
-            full_tokens = torch.cat([torch.zeros_like(tokens[:, :0]), gen_only], dim=1)  # placeholder to keep API consistent
-            # But users usually want original prompt + gen. We don't carry full prompt to save memory,
-            # so we return only the final window tokens and the generated tail for clarity:
-            final_tokens = torch.cat([tokens, torch.zeros_like(tokens[:, :0])], dim=1)  # equals tokens
+            gen_only = torch.stack(out_new, dim=1)  # [B, N_gen]
         else:
             gen_only = torch.empty(B, 0, dtype=tokens.dtype, device=device)
-            final_tokens = tokens
 
         # For convenience, return the final window state AND the generated chunk separately.
         out = {
@@ -401,6 +432,10 @@ if __name__ == "__main__":
     parser.add_argument("--min-new-tokens", type=int, default=8)
     parser.add_argument("--no-stop-on-optimum", action="store_true", help="Disable entropy plateau early-stop.")
     parser.add_argument("--eos-stop", action="store_true", help="Stop when EOS is generated.")
+    parser.add_argument("--debug-topk", action="store_true", help="Print top-10 token ids/probs at first decoding step.")
+    parser.add_argument("--debug-topk-all", action="store_true", help="Print top-10 token ids/probs at every decoding step.")
+    parser.add_argument("--zero-head-bias", action="store_true", help="Set output head bias to zero at load time (debugging collapse).")
+    parser.add_argument("--print-head-biais-topk", type=int, default=0, help="If >0, print top-K tokens by output head bias (debug).")
     args = parser.parse_args()
 
     # Ensure repo root is on sys.path when running as a script
@@ -471,10 +506,107 @@ if __name__ == "__main__":
     if unexpected:
         print(f"[load] unexpected keys: {len(unexpected)} e.g. {unexpected[:5]}")
 
+    # --- Inspect/zero output head bias (robust) ---
+    try:
+        # Heuristic: find a Linear whose out_features == vocab_size (the LM head)
+        def _find_vocab_linear(module: nn.Module, vocab_size: int) -> Optional[nn.Linear]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear) and getattr(m, "out_features", None) == int(vocab_size):
+                    return m  # first match
+            return None
+
+        head_module: Optional[nn.Linear] = None
+
+        # 1) Try common attribute names
+        for name in ("output_head", "head", "lm_head"):
+            if hasattr(model, name):
+                cand = getattr(model, name)
+                if isinstance(cand, nn.Linear) and getattr(cand, "out_features", None) == int(cfg_m.vocab_size):
+                    head_module = cand
+                    break
+
+        # 2) Fallback: scan the whole model
+        if head_module is None:
+            head_module = _find_vocab_linear(model, int(cfg_m.vocab_size))
+
+        if head_module is None:
+            print("[warn] could not locate output head Linear (to vocab).")
+        else:
+            print(f"[debug] found output head: {head_module.__class__.__name__}(in={getattr(head_module,'in_features',None)}, out={getattr(head_module,'out_features',None)})")
+
+            # Print top-K bias entries if requested
+            if args.print_head_biais_topk and int(args.print_head_biais_topk) > 0:
+                if getattr(head_module, "bias", None) is not None:
+                    with torch.no_grad():
+                        b = head_module.bias.detach().cpu()
+                        k = int(min(int(args.print_head_biais_topk), b.numel()))
+                        topv, topi = torch.topk(b, k=k, largest=True)
+                        print(f"[debug] head.bias top{k} ids:", topi.tolist())
+                        print(f"[debug] head.bias top{k} values:", [float(v) for v in topv])
+                else:
+                    print("[debug] head has no bias (nothing to print).")
+
+            # Zero the bias if requested
+            if args.zero_head_bias:
+                if getattr(head_module, "bias", None) is not None:
+                    with torch.no_grad():
+                        head_module.bias.zero_()
+                    print("[debug] zeroed output head bias.")
+                else:
+                    print("[debug] head has no bias to zero.")
+
+        # --- Fallback: scan for a vocab-sized bias Parameter (tied-head case) ---
+        if head_module is None:
+            bias_param = None
+            bias_name = None
+            vocab_N = int(cfg_m.vocab_size)
+            for name, p in model.named_parameters():
+                # Look for 1D bias-like parameters exactly of size vocab_size
+                if p.ndim == 1 and p.numel() == vocab_N:
+                    # Heuristics: prefer names that contain 'bias' or 'out'
+                    if ('bias' in name.lower()) or ('out' in name.lower()) or ('head' in name.lower()):
+                        bias_param = p
+                        bias_name = name
+                        break
+            # If none matched the heuristic, accept the first 1D param of vocab size
+            if bias_param is None:
+                for name, p in model.named_parameters():
+                    if p.ndim == 1 and p.numel() == vocab_N:
+                        bias_param = p
+                        bias_name = name
+                        break
+
+            if bias_param is not None:
+                print(f"[debug] found vocab-sized bias param: {bias_name} shape={tuple(bias_param.shape)}")
+                if args.print_head_biais_topk and int(args.print_head_biais_topk) > 0:
+                    with torch.no_grad():
+                        b = bias_param.detach().cpu()
+                        k = int(min(int(args.print_head_biais_topk), b.numel()))
+                        topv, topi = torch.topk(b, k=k, largest=True)
+                        print(f"[debug] bias(top){k} ids:", topi.tolist())
+                        print(f"[debug] bias(top){k} values:", [float(v) for v in topv])
+                if args.zero_head_bias:
+                    with torch.no_grad():
+                        bias_param.zero_()
+                    print(f"[debug] zeroed vocab-sized bias param: {bias_name}")
+            else:
+                print("[warn] could not locate output head Linear nor a vocab-sized bias Parameter.")
+    except Exception as e:
+        print(f"[warn] head-bias debug failed: {e}")
+
+
+
+
+
+
+
+
     enc = tok(args.prompt, return_tensors="pt", add_special_tokens=False)
     tokens = enc["input_ids"].to(device)
     mask = enc.get("attention_mask", None)
     if mask is not None: mask = mask.to(device)
+
+    print(f"[debug] prompt_len_tokens={tokens.size(1)} | model_W={int(raw.get('W', cfg_m.W))} | model_O={int(raw.get('O', cfg_m.O))}")
 
     # Sanity: head dimension must match vocab_size
     with torch.no_grad():
@@ -486,6 +618,14 @@ if __name__ == "__main__":
         raise SystemExit(f"[error] head dim V={V} != cfg.vocab_size={int(cfg_m.vocab_size)}. "
                          f"Check tokenizer/ckpt/config alignment.")
 
+    # Debug: show what common suspect IDs decode to (e.g., 11 is often ',' in GPT-2)
+    try:
+        for suspect in [11, tok.eos_token_id, 0]:
+            if 0 <= int(suspect) < V:
+                print(f"[debug] suspect id {int(suspect)} decodes to: '{tok.decode([int(suspect)], skip_special_tokens=False)}'")
+    except Exception as _e:
+        print(f"[warn] token decode debug failed: {_e}")
+
     cfg_s = StreamerConfig(
         W=cfg_m.W, O=cfg_m.O,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
@@ -495,6 +635,8 @@ if __name__ == "__main__":
         min_p=args.min_p,
         stop_on_optimum=not args.no_stop_on_optimum, opt_window=8, opt_patience=4, opt_eps=1e-3, min_new_tokens=max(2, args.min_new_tokens),
         teleport_every=None, teleport_on_low_capacity=False, cap_threshold=0.10, keep_collar_on_teleport=True,
+        debug_topk=bool(args.debug_topk),
+        debug_topk_all=bool(args.debug_topk_all),
         device=str(device), pad_id=cfg_m.pad_id, eos_id=int(tok.eos_token_id) if args.eos_stop else None,
     )
     streamer = Streamer(model, cfg_s)
