@@ -36,7 +36,8 @@ def _safe_mean(x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         x = x * mask.to(dtype=x.dtype, device=x.device)
         denom = mask.to(dtype=x.dtype, device=x.device).sum().clamp_min(1.0)
     else:
-        denom = torch.tensor(float(x.numel()/x.shape[-1]), device=x.device, dtype=x.dtype)  # per-token mean
+        # mean over all elements when no mask is provided
+        denom = torch.tensor(float(x.numel()), device=x.device, dtype=x.dtype)
     return x.sum() / denom
 
 
@@ -148,7 +149,12 @@ class CapacityLedger(nn.Module):
 
         if loss is not None:
             loss_val = float(loss) if not isinstance(loss, torch.Tensor) else float(loss.detach().item())
-            l_val = self.loss_ema.update(torch.tensor(loss_val, device=self.entropy_ema.value().device if isinstance(self.entropy_ema.value(), torch.Tensor) else logits.device))
+            # choose a safe device even if logits is None
+            if isinstance(self.entropy_ema.value(), torch.Tensor):
+                dev = self.entropy_ema.value().device
+            else:
+                dev = logits.device if logits is not None else torch.device("cpu")
+            l_val = self.loss_ema.update(torch.tensor(loss_val, device=dev))
             out["loss_ema"] = float(l_val if not isinstance(l_val, torch.Tensor) else l_val.item())
 
         s.steps += 1
@@ -188,6 +194,8 @@ class CapacityLedger(nn.Module):
         else:
             cap = -H  # higher “capacity” when entropy low → more negative H; keep as a signal
 
+        if mask is not None and mask.dtype is not torch.bool:
+            mask = mask.to(torch.bool)
         if mask is not None:
             cap = torch.where(mask.to(dtype=torch.bool, device=cap.device), cap, torch.as_tensor(fill_masked_with, device=cap.device, dtype=cap.dtype))
 
@@ -209,38 +217,74 @@ class CapacityLedger(nn.Module):
         )
         return out
 
-    def state_dict(self) -> Dict[str, object]:
-        d = {
-            "vocab_size": self.vocab_size,
+
+    def get_extra_state(self):
+        """
+        Provide extra state to be saved alongside the module's state_dict
+        without overriding nn.Module.state_dict(). This keeps compatibility
+        with PyTorch's recursion and avoids signature mismatches.
+        """
+        return {
+            "vocab_size": int(self.vocab_size),
             "state": asdict(self.state),
             "ema_entropy": self.entropy_ema.state_dict(),
             "ema_loss": self.loss_ema.state_dict(),
         }
-        return d
 
-    def load_state_dict(self, state: Dict[str, object]) -> None:
-        self.vocab_size = int(state.get("vocab_size", self.vocab_size))  # type: ignore[arg-type]
+    def set_extra_state(self, state):
+        """
+        Restore payload saved by get_extra_state(). Also supports older flat
+        payloads for backward compatibility.
+        """
+        if not isinstance(state, dict):
+            return
+
+        # vocab size
+        try:
+            if "vocab_size" in state:
+                self.vocab_size = int(state["vocab_size"])
+        except Exception:
+            pass
+
+        # dataclass LedgerState
         st = state.get("state", None)
         if isinstance(st, dict):
-            self.state.steps = int(st.get("steps", self.state.steps))
-            self.state.tokens_seen = int(st.get("tokens_seen", self.state.tokens_seen))
-            self.state.ema_alpha = float(st.get("ema_alpha", self.state.ema_alpha))
-        # EMA payloads
+            try:
+                self.state.steps = int(st.get("steps", self.state.steps))
+                self.state.tokens_seen = int(st.get("tokens_seen", self.state.tokens_seen))
+                self.state.ema_alpha = float(st.get("ema_alpha", self.state.ema_alpha))
+            except Exception:
+                pass
+
+        # EMA payloads (new nested form)
         ema_e = state.get("ema_entropy", None)
         if isinstance(ema_e, dict):
-            self.entropy_ema.load_state_dict(ema_e)
+            try:
+                self.entropy_ema.load_state_dict(ema_e)
+            except Exception:
+                pass
         else:
-            # backward-compat: old flat tensor
+            # backward-compat: accept old flat key 'entropy_mean'
             ent = state.get("entropy_mean", None)
             if ent is not None:
-                self.entropy_ema.reset(torch.as_tensor(ent))
+                try:
+                    self.entropy_ema.reset(torch.as_tensor(ent))
+                except Exception:
+                    pass
+
         ema_l = state.get("ema_loss", None)
         if isinstance(ema_l, dict):
-            self.loss_ema.load_state_dict(ema_l)
+            try:
+                self.loss_ema.load_state_dict(ema_l)
+            except Exception:
+                pass
         else:
             los = state.get("loss_mean", None)
             if los is not None:
-                self.loss_ema.reset(torch.as_tensor(los))
+                try:
+                    self.loss_ema.reset(torch.as_tensor(los))
+                except Exception:
+                    pass
 
 
 # ---------------------------------- __main__ ----------------------------------

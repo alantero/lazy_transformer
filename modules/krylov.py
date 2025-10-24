@@ -67,6 +67,19 @@ def _mgs_orthonormalize(V: Tensor, eps: float = 1e-9) -> Tensor:
     return Q
 
 
+def _flatten_mask(mask: Optional[Tensor], prefix_N: Tuple[int, ...], N: int) -> Optional[Tensor]:
+    if mask is None:
+        return None
+    # Ensure mask has last dim N (broadcast from 1 if needed)
+    if mask.shape[-1] != N:
+        if mask.shape[-1] == 1:
+            mask = mask.expand(*mask.shape[:-1], N)
+        else:
+            raise ValueError(f"mask last dim must be N={N}, got {tuple(mask.shape)}")
+    M, _ = _flatten_bt(mask.to(dtype=torch.bool))
+    return M.to(dtype=torch.float32)
+
+
 @torch.no_grad()
 def build_krylov_basis(
     apply: Callable[[Tensor], Tensor],
@@ -75,10 +88,13 @@ def build_krylov_basis(
     *,
     ortho: _Ortho = "mgs",
     eps: float = 1e-9,
+    mask: Optional[Tensor] = None,
+    freeze_masked: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     """
     Construye bases V=[v0..v_{m-1}] y W=[A v0..A v_{m-1}] por batch.
       residual r: shape [..., N] → aplanamos a [B,N].
+      mask:       shape [..., N] (True=activo, False=congelado). Si freeze_masked=True, se fuerza 0 en esas posiciones.
     Devuelve:
       V: [B, m, N] (ortonormal si ortho='mgs'), W: [B, m, N] = A V
     """
@@ -87,16 +103,20 @@ def build_krylov_basis(
     R, prefix = _flatten_bt(residual)      # [B,N]
     B, N = R.shape
 
+    M = _flatten_mask(mask, prefix, N)  # [B,N] o None
+    if M is not None and freeze_masked:
+        R = R * M
+
     # v0 = r / ||r||
     nrmr = _norm2(R, eps=eps)              # [B,1]
     v0 = R / nrmr                          # [B,N]
 
     V = [v0]
     for _ in range(1, m):
-        Vk = torch.stack(V, dim=1)         # [B,k,N]
         # A @ v_{k-1}
         ak = apply(V[-1]).reshape(B, N)    # [B,N]
-        # simple next dir: A v_{k-1} (sin Arnoldi completo para mantenerlo “lazy”)
+        if M is not None and freeze_masked:
+            ak = ak * M
         V.append(ak)
 
     Vt = torch.stack(V, dim=1)             # [B,m,N]
@@ -105,8 +125,14 @@ def build_krylov_basis(
     if ortho == "mgs":
         Vt = _mgs_orthonormalize(Vt, eps=eps)
 
-    # W = A V
-    W = torch.stack([apply(Vt[:, i, :]).reshape(B, N) for i in range(m)], dim=1)  # [B,m,N]
+    # W = A V (enmascarado si procede)
+    W_list = []
+    for i in range(m):
+        wi = apply(Vt[:, i, :]).reshape(B, N)
+        if M is not None and freeze_masked:
+            wi = wi * M
+        W_list.append(wi)
+    W = torch.stack(W_list, dim=1)  # [B,m,N]
     return Vt, W
 
 
@@ -117,11 +143,12 @@ def krylov_lazy_correction(
     m: int = 2,
     ortho: _Ortho = "mgs",
     eps: float = 1e-9,
+    mask: Optional[Tensor] = None,
+    freeze_masked: bool = True,
 ) -> Tensor:
     """
     Resuelve min_c || A (V c) - r ||_2 en subespacio de Krylov K_m(A, r).
-      apply: función que aplica A sobre un batched vector [..., N] → [..., N]
-      residual r: mismo shape [..., N]
+      mask: posiciones congeladas (se proyecta base y W si freeze_masked=True, y la delta final se anula en esas posiciones).
     Devuelve:
       delta: corrección en el espacio original (mismo shape que r).
     """
@@ -129,27 +156,31 @@ def krylov_lazy_correction(
     B, N = R.shape
 
     # Bases
-    V, W = build_krylov_basis(apply, residual, m=m, ortho=ortho, eps=eps)  # [B,m,N] cada uno
+    V, W = build_krylov_basis(
+        apply, residual, m=m, ortho=ortho, eps=eps, mask=mask, freeze_masked=freeze_masked
+    )  # [B,m,N] cada uno
 
-    # Normal equations: (W^T W) c = W^T r   (todo por batch)
-    # G = W W^T per fila? No: queremos [B,m,m] = W @ W^T sobre dim N (matriz Gram)
-    G = torch.einsum("bmn,bkn->bmk", W, W)            # [B,m,m]  (m pequeño → estable)
+    # (W^T W) c = W^T r
+    G = torch.einsum("bmn,bkn->bmk", W, W)            # [B,m,m]
     b = torch.einsum("bmn,bn->bm", W, R)              # [B,m]
 
-    # Regulariza ligeramente por estabilidad si mal condicionada
     lam = eps
     eye = torch.eye(m, device=G.device, dtype=G.dtype).unsqueeze(0).expand(B, m, m)
     G_reg = G + lam * eye
 
-    # Resuelve c (por batch). torch.linalg.solve soporta [B,m,m] × [B,m]
     try:
         c = torch.linalg.solve(G_reg, b.unsqueeze(-1)).squeeze(-1)  # [B,m]
     except RuntimeError:
-        # Fallback a lstsq si singular
         c = torch.linalg.lstsq(G_reg, b.unsqueeze(-1)).solution.squeeze(-1)
 
     # δ = V c
     delta = torch.einsum("bmn,bm->bn", V, c)          # [B,N]
+
+    # Cierra con máscara si procede
+    if mask is not None:
+        M = _flatten_mask(mask, prefix, N)  # [B,N]
+        delta = delta * M
+
     return _unflatten_bt(delta, prefix)               # [...,N]
 
 
@@ -170,8 +201,17 @@ class KrylovRefiner(nn.Module):
         self.ortho: _Ortho = ortho
 
     @torch.no_grad()
-    def refine(self, apply: Callable[[Tensor], Tensor], residual: Tensor) -> Tensor:
-        return krylov_lazy_correction(apply, residual, m=self.m, ortho=self.ortho)
+    def refine(
+        self,
+        apply: Callable[[Tensor], Tensor],
+        residual: Tensor,
+        *,
+        mask: Optional[Tensor] = None,
+        freeze_masked: bool = True,
+    ) -> Tensor:
+        return krylov_lazy_correction(
+            apply, residual, m=self.m, ortho=self.ortho, mask=mask, freeze_masked=freeze_masked
+        )
 
 
 # ---------------------------------- __main__ ----------------------------------

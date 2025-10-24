@@ -7,7 +7,7 @@
   "groups": 16,
 
   "cheb_deg": 8,
-  "cheb_laplacian": "path",
+  "cheb_laplacian": "path_causal",
   "skew_rank": 8,
   "R_rank": 4,
 
@@ -48,6 +48,10 @@
   "keep_last_k": 5,
   "best_metric_name": "loss",
 
-  "grads_border_only": false
+  "grads_border_only": false,
+
+  "state_w": 0.0,
+  "state_mask": "all",
+  "state_kind": "energy_contract"
 }
 

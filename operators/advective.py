@@ -4,9 +4,11 @@
 #   - Central (2nd order) or upwind (1st order) finite differences
 #   - Periodic ('cycle') or non-periodic ('path', Dirichlet style) boundaries
 #   - Groupwise speeds: a learnable scalar speed per group (broadcasted over channels)
+#   - Optional attention/pad mask to zero out pads and avoid using them in differences
 #
 # Shapes:
 #   Input  x: [B, T, D]  (batch, time/sequence, features)
+#   Input  mask: [B, T] (bool, optional) pads are zeroed in outputs and never used to form differences
 #   Output y: [B, T, D]
 #
 # Notas:
@@ -41,6 +43,10 @@ class Advective1D(nn.Module):
       learn_speed: if True, speed per group is a trainable Parameter; else it's a buffer
       speed_init: initial speed value (applied to all groups)
       causal: if True, enforce strict causality (no access to x[:, t+1:]) by using a left-padded depthwise conv that implements a backward finite difference. Defaults to False to preserve existing numerical tests (periodic central differences).
+
+    Forward Args:
+      x: input tensor of shape [B, T, D]
+      mask: optional attention/pad mask of shape [B, T] (bool). Pads are zeroed in outputs and never used to form differences.
     """
     def __init__(
         self,
@@ -93,11 +99,42 @@ class Advective1D(nn.Module):
         else:
             self.speed.copy_(vec)
 
-    def _causal_backward_diff(self, x: Tensor) -> Tensor:
+    def _canon_mask(self, mask: Tensor | None, B: int, T: int, device: torch.device) -> Tensor | None:
+        """
+        Convert mask to canonical bool tensor of shape [B, T, 1, 1] for broadcasting.
+        Accepts None, [B,T], [B,T,1], or [B,T,1,1].
+        Returns None if input is None.
+        """
+        if mask is None:
+            return None
+        if not torch.is_tensor(mask):
+            raise TypeError("mask must be a tensor or None")
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+        if mask.device != device:
+            mask = mask.to(device)
+        if mask.dim() == 2:
+            # [B,T]
+            return mask.view(B, T, 1, 1)
+        elif mask.dim() == 3:
+            # [B,T,1]
+            if mask.shape[2] != 1:
+                raise ValueError(f"mask with 3 dims must have shape [B,T,1], got {tuple(mask.shape)}")
+            return mask.view(B, T, 1, 1)
+        elif mask.dim() == 4:
+            # [B,T,1,1]
+            if mask.shape[2] != 1 or mask.shape[3] != 1:
+                raise ValueError(f"mask with 4 dims must have shape [B,T,1,1], got {tuple(mask.shape)}")
+            return mask
+        else:
+            raise ValueError(f"mask must have 2,3 or 4 dims, got {mask.dim()}")
+
+    def _causal_backward_diff(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
         """
         Compute causal (backward) finite difference using a depthwise 1D conv
         implemented with left padding. Does NOT look at future indices.
         x: [B, T, D]  -> returns diff: [B, T, D]
+        mask: optional [B, T] bool mask, pads zeroed in output and not used in differences
         """
         B, T, D = x.shape
         # Conv1d expects [B, C, T]
@@ -112,11 +149,21 @@ class Advective1D(nn.Module):
         # Depthwise conv: groups=D
         diff = F.conv1d(xc_pad, weight, bias=bias, stride=1, padding=0, dilation=1, groups=D)
         # back to [B, T, D]
-        return diff.permute(0, 2, 1).contiguous()
+        diff = diff.permute(0, 2, 1).contiguous()
+        # No past sample at t=0
+        diff[:, 0, :] = 0.0
+        if mask is not None:
+            # mask: [B, T] bool
+            diff = diff * mask.unsqueeze(-1).to(diff.dtype)
+        return diff
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
         """
         Apply advective operator. x: [B,T,D] -> y: [B,T,D]
+
+        Args:
+          x: input tensor [B, T, D]
+          mask: optional attention/pad mask [B, T] bool, pads zeroed in output and never used to form differences
         """
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must be [B,T,{self.d_model}], got {tuple(x.shape)}")
@@ -124,27 +171,66 @@ class Advective1D(nn.Module):
         B, T, D = x.shape
         g, cg = self.groups, self.cg
 
-        # Reshape to [B,T,G,Cg] to broadcast group speeds over channels in the group
-        xg = x.view(B, T, g, cg)
+        m = self._canon_mask(mask, B, T, x.device)  # [B,T,1,1] or None
 
-        # --- Causal fast-path: do not look at x[:, t+1:] ---
         if self.causal:
             # Use strictly backward finite differences (depthwise conv) along time
-            diff_full = self._causal_backward_diff(x)  # [B, T, D]
-            # reshape back to grouped view to apply groupwise speeds
+            diff_full = self._causal_backward_diff(x, mask=m.squeeze(-1).squeeze(-1) if m is not None else None)  # [B, T, D]
             diff = diff_full.view(B, T, g, cg)
         else:
+            # Reshape to [B,T,G,Cg] to broadcast group speeds over channels in the group
+            xg = x.view(B, T, g, cg)
+
+            if m is not None:
+                mb = m  # [B,T,1,1]
+                # neighbor masks
+                m_left = torch.zeros_like(mb)
+                m_left[:, 1:, ...] = mb[:, :-1, ...]
+                m_right = torch.zeros_like(mb)
+                m_right[:, :-1, ...] = mb[:, 1:, ...]
+
             if self.scheme == "central":
                 if self.bc == "cycle":
                     right = torch.roll(xg, shifts=-1, dims=1)
                     left  = torch.roll(xg, shifts=+1, dims=1)
-                    diff = (right - left) / (2.0 * self.dx)
+                    if m is None:
+                        diff = (right - left) / (2.0 * self.dx)
+                    else:
+                        mb_right = torch.roll(mb, shifts=-1, dims=1)
+                        mb_left = torch.roll(mb, shifts=+1, dims=1)
+                        valid_central = mb & mb_left & mb_right
+                        diff = torch.zeros_like(xg)
+                        # central where all three valid
+                        diff[valid_central] = ((right - left) / (2.0 * self.dx))[valid_central]
+                        # fallback to one-sided diffs where possible
+                        valid_back = mb & m_left & (~valid_central)
+                        diff[valid_back] = ((xg - left) / self.dx)[valid_back]
+                        valid_fwd = mb & m_right & (~valid_central) & (~valid_back)
+                        diff[valid_fwd] = ((right - xg) / self.dx)[valid_fwd]
+                        # else zero
                 else:  # 'path'
-                    diff = torch.empty_like(xg)
-                    diff[:, 1:-1, ...] = (xg[:, 2:, ...] - xg[:, :-2, ...]) / (2.0 * self.dx)
-                    diff[:, 0,    ...] = (xg[:, 1,    ...] - xg[:, 0,     ...]) / self.dx
-                    diff[:, -1,   ...] = (xg[:, -1,   ...] - xg[:, -2,    ...]) / self.dx
-
+                    diff = torch.zeros_like(xg)
+                    x_left = torch.empty_like(xg)
+                    x_left[:, 1:, ...] = xg[:, :-1, ...]
+                    x_left[:, 0, ...] = 0.0
+                    x_right = torch.empty_like(xg)
+                    x_right[:, :-1, ...] = xg[:, 1:, ...]
+                    x_right[:, -1, ...] = 0.0
+                    if m is None:
+                        diff[:, 1:-1, ...] = (x_right[:, 1:-1, ...] - x_left[:, 1:-1, ...]) / (2.0 * self.dx)
+                        diff[:, 0,    ...] = (xg[:, 1,    ...] - xg[:, 0,     ...]) / self.dx
+                        diff[:, -1,   ...] = (xg[:, -1,   ...] - xg[:, -2,    ...]) / self.dx
+                    else:
+                        valid_central = mb & m_left & m_right
+                        valid_back = mb & m_left & (~m_right)
+                        valid_fwd = mb & (~m_left) & m_right
+                        # central interior
+                        diff[valid_central] = ((x_right - x_left) / (2.0 * self.dx))[valid_central]
+                        # backward at left border or where no right neighbor
+                        diff[valid_back] = ((xg - x_left) / self.dx)[valid_back]
+                        # forward at right border or where no left neighbor
+                        diff[valid_fwd] = ((x_right - xg) / self.dx)[valid_fwd]
+                        # else zero (pads or invalid)
             elif self.scheme == "upwind":
                 v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)
                 if self.bc == "cycle":
@@ -157,6 +243,11 @@ class Advective1D(nn.Module):
                     fwd  = torch.empty_like(xg)
                     fwd[:, :-1, ...] = xg[:, 1:, ...] - xg[:, :-1, ...]
                     fwd[:, -1,  ...] = 0.0
+                if m is not None:
+                    valid_back = mb & m_left
+                    valid_fwd = mb & m_right
+                    back = torch.where(valid_back, back, torch.zeros_like(back))
+                    fwd = torch.where(valid_fwd, fwd, torch.zeros_like(fwd))
                 diff = torch.where(v >= 0, back, fwd) / self.dx
             else:
                 raise ValueError("scheme must be 'central' or 'upwind'.")
@@ -166,7 +257,10 @@ class Advective1D(nn.Module):
         yg = v * diff
 
         # Restore to [B,T,D]
-        y = yg.view(B, T, D)
+        if m is not None:
+            y = (yg.view(B, T, D)) * (m.squeeze(-1).squeeze(-1).to(yg.dtype))
+        else:
+            y = yg.view(B, T, D)
         return y
 
 

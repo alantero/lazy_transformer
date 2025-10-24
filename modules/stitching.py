@@ -7,7 +7,7 @@
 # If you keep [B, D, n_win, W] elsewhere, pass layout="bdnw" and we’ll adapt.
 
 from __future__ import annotations
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,40 @@ Tensor = torch.Tensor
 _Layout = Literal["bnwd", "bdnw"]
 _Align = Literal["none", "scale", "affine"]
 
+def _coerce_mask_to_bnwd(mask: Tensor, layout: _Layout, windows: Tensor) -> Tensor:
+    """
+    Convert various mask shapes to a boolean mask of shape [B, n_win, W] aligned with 'bnwd' layout.
+    Accepts masks with shapes:
+      [B, n_win, W], [B, n_win, W, 1], [B, 1, n_win, W], [B, n_win, 1, W], [B, D, n_win, W], [B, n_win, W, D].
+    """
+    if mask.dim() != 3 and mask.dim() != 4:
+        raise ValueError(f"Mask must be 3D or 4D tensor, got shape {tuple(mask.shape)}")
+    x = windows
+    B, nW, W, D = x.shape
+    # Permute mask to bnwd layout if needed
+    if layout == "bdnw":
+        # mask shape might be [B, D, n_win, W] or [B, 1, n_win, W]
+        if mask.dim() == 4:
+            mask = mask.permute(0, 2, 3, 1).contiguous()  # to [B, n_win, W, D]
+    # Now mask is either 3D or 4D in bnwd order
+    if mask.dim() == 4:
+        # Remove trailing or leading singleton dims if present
+        if mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        elif mask.shape[2] == 1:
+            mask = mask.squeeze(2)
+        # If still 4D and has channel dim (D), reduce over last dim
+        if mask.dim() == 4:
+            mask = mask.any(dim=-1)
+    elif mask.dim() == 3:
+        # Possibly [B, n_win, W], good as is
+        pass
+    else:
+        raise ValueError(f"Unexpected mask dimension after processing: {mask.dim()}")
+    # Final check shape
+    if mask.shape != (B, nW, W):
+        raise ValueError(f"Mask shape after processing must be [B, n_win, W], got {tuple(mask.shape)}")
+    return mask.to(dtype=torch.bool)
 
 # ------------------------------- shape helpers --------------------------------
 
@@ -87,10 +121,11 @@ def overlap_pairs(n_win: int, W: int, O: int) -> List[Tuple[slice, slice, int, i
 # --------------------------- optional Procrustes fit ---------------------------
 
 @torch.no_grad()
-def _fit_groupwise_affine(x: Tensor, y: Tensor, groups: int, kind: _Align, eps: float = 1e-8) -> Tuple[Tensor, Tensor]:
+def _fit_groupwise_affine(x: Tensor, y: Tensor, groups: int, kind: _Align, eps: float = 1e-8, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
     """
     Fit per-group scale (and optional bias) to map x ≈ s * x (+ a) ≈ y over [B, O, D].
     Returns (s, a) shaped [1,1,G,1] for easy broadcasting to [B,O,G,Cg].
+    Supports optional mask of shape [B,O] for weighted estimates.
     """
     if kind == "none":
         device, dtype = x.device, x.dtype
@@ -107,11 +142,26 @@ def _fit_groupwise_affine(x: Tensor, y: Tensor, groups: int, kind: _Align, eps: 
     xg = x.view(B, O, groups, Cg)
     yg = y.view(B, O, groups, Cg)
 
-    # Means over positions/channels; keep dims for broadcasting
-    mx = xg.mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
-    my = yg.mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
-    vx = (xg - mx).pow(2).mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
-    cov = ((xg - mx) * (yg - my)).mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
+    if mask is not None:
+        if mask.shape != (B, O):
+            raise ValueError(f"Mask shape must be [B,O], got {mask.shape}")
+        mask_exp = mask.view(B, O, 1, 1).expand(B, O, groups, Cg).to(dtype=x.dtype)
+        denom = mask_exp.sum(dim=(1,3), keepdim=True).clamp_min(eps)  # [B,1,G,1]
+        if torch.all(denom == 0):
+            device, dtype = x.device, x.dtype
+            one = torch.ones((), device=device, dtype=dtype)
+            zero = torch.zeros((), device=device, dtype=dtype)
+            return one.view(1, 1, groups, 1), zero.view(1, 1, groups, 1)
+        mx = ((xg * mask_exp).sum(dim=(1,3), keepdim=True)) / denom  # [B,1,G,1]
+        my = ((yg * mask_exp).sum(dim=(1,3), keepdim=True)) / denom  # [B,1,G,1]
+        vx = (((xg - mx).pow(2) * mask_exp).sum(dim=(1,3), keepdim=True)) / denom  # [B,1,G,1]
+        cov = ((((xg - mx) * (yg - my)) * mask_exp).sum(dim=(1,3), keepdim=True)) / denom  # [B,1,G,1]
+    else:
+        # Means over positions/channels; keep dims for broadcasting
+        mx = xg.mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
+        my = yg.mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
+        vx = (xg - mx).pow(2).mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
+        cov = ((xg - mx) * (yg - my)).mean(dim=(1, 3), keepdim=True)  # [B,1,G,1]
 
     s = cov / (vx + eps)  # [B,1,G,1]
     if kind == "scale":
@@ -169,6 +219,7 @@ def stitching_loss(
     layout: _Layout = "bnwd",
     align: _Align = "none",
     groups: Optional[int] = None,
+    mask: Optional[Tensor] = None,
     reduction: Literal["mean", "sum"] = "mean",
     eps: float = 1e-8,
 ) -> Tuple[Tensor, Dict[str, float]]:
@@ -177,6 +228,7 @@ def stitching_loss(
     - windows: [B, n_win, W, D] (or [B, D, n_win, W] with layout='bdnw')
     - align: 'none' | 'scale' | 'affine' (per-group alignment before measuring)
     - groups: required if align != 'none' (D must be divisible by groups)
+    - mask: optional boolean mask tensor to weigh valid tokens
 
     Returns (loss, stats), where stats includes MSE and cosine similarity on overlaps.
     """
@@ -186,6 +238,11 @@ def stitching_loss(
         raise ValueError(f"W mismatch: arg W={W}, tensor W={W_}.")
     if O < 0 or O > W:
         raise ValueError(f"O must be in [0, W]. Got O={O}, W={W}.")
+
+    if mask is not None:
+        m_bnwd = _coerce_mask_to_bnwd(mask, layout, x)  # [B, nW, W], bool
+    else:
+        m_bnwd = None
 
     if O == 0 or nW <= 1:
         # No overlaps → zero loss but valid stats
@@ -205,11 +262,21 @@ def stitching_loss(
         xi = x[:, i, sl_i, :]  # tail of window i
         xj = x[:, j, sl_j, :]  # head of window j
 
+        if m_bnwd is not None:
+            mi = m_bnwd[:, i, sl_i]  # [B, O]
+            mj = m_bnwd[:, j, sl_j]  # [B, O]
+            mij = mi & mj  # [B, O]
+            if not mij.any():
+                # No valid tokens in overlap, skip pair without incrementing denom
+                continue
+        else:
+            mij = None
+
         # Optional per-group alignment of xi toward xj (or vice versa)
         if align != "none":
             if groups is None:
                 raise ValueError("groups must be provided when align!='none'.")
-            s, a = _fit_groupwise_affine(xi, xj, groups=groups, kind=align, eps=eps)
+            s, a = _fit_groupwise_affine(xi, xj, groups=groups, kind=align, eps=eps, mask=mij)
             xi_al = _apply_groupwise_affine(xi, s, a)
             # Uncomment to also align xj to xi and average, if desired.
             # s2, a2 = _fit_groupwise_affine(xj, xi, groups=groups, kind=align, eps=eps)
@@ -219,19 +286,37 @@ def stitching_loss(
         else:
             diff = xi - xj  # [B,O,D]
 
-        # MSE over this overlap
-        mse = torch.mean(diff.pow(2))
+        if mij is not None:
+            mij3 = mij.unsqueeze(-1)  # [B,O,1]
+            valid_sum = mij3.sum().clamp_min(1.0)
+            # MSE over this overlap with masking
+            mse = (diff.pow(2) * mij3).sum() / valid_sum
+
+            # Cosine similarity (flatten over valid elements)
+            xi_v = xi[mij3.expand_as(xi)]
+            xj_v = xj[mij3.expand_as(xj)]
+            dot = (xi_v * xj_v).sum()
+            nx = xi_v.pow(2).sum().sqrt().clamp_min(eps)
+            ny = xj_v.pow(2).sum().sqrt().clamp_min(eps)
+            cos = dot / (nx * ny)
+
+            # ΔBKM-style scalar (same as we used in task_loss suggestion)
+            bkm = ((xj - xi).pow(2) * mij3).sum() / valid_sum
+        else:
+            # MSE over this overlap
+            mse = torch.mean(diff.pow(2))
+
+            # Cosine similarity (flatten over B,O,D)
+            xi_vec = xi.reshape(B, -1)
+            xj_vec = xj.reshape(B, -1)
+            num = (xi_vec * xj_vec).sum(dim=1)
+            den = (xi_vec.norm(dim=1) * xj_vec.norm(dim=1)).clamp_min(eps)
+            cos = (num / den).mean()
+
+            # ΔBKM-style scalar (same as we used in task_loss suggestion)
+            bkm = torch.mean((xj - xi).pow(2))
+
         total_loss = mse if total_loss is None else (total_loss + mse)
-
-        # Cosine similarity (flatten over B,O,D)
-        xi_vec = xi.reshape(B, -1)
-        xj_vec = xj.reshape(B, -1)
-        num = (xi_vec * xj_vec).sum(dim=1)
-        den = (xi_vec.norm(dim=1) * xj_vec.norm(dim=1)).clamp_min(eps)
-        cos = (num / den).mean()
-
-        # ΔBKM-style scalar (same as we used in task_loss suggestion)
-        bkm = torch.mean((xj - xi).pow(2))
 
         mse_acc += float(mse.detach().cpu())
         cos_acc += float(cos.detach().cpu())
@@ -284,7 +369,7 @@ class StitchingLoss(nn.Module):
         self.eps = float(eps)
         self.weight = float(weight)
 
-    def forward(self, windows: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+    def forward(self, windows: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Dict[str, float]]:
         loss, stats = stitching_loss(
             windows,
             W=self.W,
@@ -292,6 +377,7 @@ class StitchingLoss(nn.Module):
             layout=self.layout,
             align=self.align,
             groups=self.groups,
+            mask=mask,
             reduction=self.reduction,
             eps=self.eps,
         )
@@ -376,5 +462,15 @@ if __name__ == "__main__":
         mse_after = float(torch.mean((A_al - Bbasis) ** 2))
         print(f"  procrustes: mse_before={mse_before:.3e} → mse_after={mse_after:.3e}")
         assert mse_after < 1e-6
+
+    # 6) Masking test: zero out head overlap of one pair, verify loss ~0 and no crash
+    mask = torch.ones(B, n_win, W, dtype=torch.bool)
+    # zero out head overlap of window 1 (overlap with window 0)
+    mask[:, 1, :O] = 0
+    # Use perfect windows, so masked overlap should contribute ~0 loss
+    loss_masked, stats_masked = stitching_loss(wins, W=W, O=O, layout="bnwd", align="none", mask=mask)
+    print(f"  mask: loss with masked overlap={float(loss_masked):.3e}, stats={ {k: f'{v:.3e}' for k,v in stats_masked.items()} }")
+    # The loss should be less than or equal to perfect loss (which is ~0)
+    assert float(loss_masked) < 1e-12
 
     print("[stitching] All good ✓")

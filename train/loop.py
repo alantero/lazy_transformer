@@ -47,6 +47,7 @@ from modules.quant import calibrate_model, toggle_fakequant_collect
 from train.checkpoints import CheckpointManager  # checkpoint management
 from optim.schedulers import make_scheduler  # learning-rate schedulers
 from utils.profile import Timer, record_function as prof_record_function, nvtx_range, ThroughputMeter, gpu_mem
+from modules.ledger import CapacityLedger
 from contextlib import nullcontext
 
 
@@ -161,6 +162,11 @@ class LoopConfig:
     debug_state_norm: bool = False      # log hidden-state norm stats before head projection
     debug_topk: int = 0                 # if >0, log top-k token ids/probs at the first debug step
 
+    # state regularizer (energy non-expansion)
+    state_w: float = 0.0                 # weight of L_state (0 => disabled)
+    state_mask: str = "all"             # 'all' or 'collar'
+    state_kind: str = "energy_contract" # future-proof: one kind for now
+
 
 # ----------------------------------- model ------------------------------------
 
@@ -206,9 +212,12 @@ class ContinuousBlock(nn.Module):
         )
         self.integ = Integrator(self.field, method=method, dt=dt, steps=integ_steps)
 
-    def forward(self, x: torch.Tensor, step_hook=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, step_hook=None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B', W, D]
+        Returns:
+            post: [B', W, D]  (after integration)
+            pre:  [B', W, D]  (before integration, Chebyshev output)
         """
         # Groupwise norm on features (per-group normalization)
         x = groupwise_norm(x, groups=self.groups, axis=-1, eps=1e-6)
@@ -229,7 +238,7 @@ class ContinuousBlock(nn.Module):
 
         # Integrate Port-Hamiltonian dynamics
         z = self.integ(y, step_hook=step_hook)  # [B', W, D]
-        return z
+        return z, y
 
 
 class ContinuousLM(nn.Module):
@@ -298,7 +307,7 @@ class ContinuousLM(nn.Module):
         self._dual_use_log = bool(cfg.dual_use_log)
         self._dual_var_aware = bool(cfg.dual_var_aware)
         if cfg.use_dual_rate:
-            tgt_bpp = cfg.target_bpp if cfg.target_bpp is not None else 0.6 * math.log2(cfg.vocab_size)
+            tgt_bpp = cfg.target_bpp if (cfg.target_bpp is not None) else 0.6 * math.log2(cfg.vocab_size)
             target_for_sda = math.log(max(tgt_bpp, 1e-6)) if self._dual_use_log else float(tgt_bpp)
             # Keep a copy of the target in the working domain to normalize gaps
             self._sda_target = float(target_for_sda)
@@ -307,6 +316,9 @@ class ContinuousLM(nn.Module):
             self.register_buffer("_logbpp_var", torch.tensor(1.0, dtype=torch.float32))
             # Dual object
             self.sda = DualSDA({"bpp": target_for_sda}, lrs={"bpp": cfg.dual_lr}, ema_alpha=cfg.dual_ema, use_sda=True)
+
+        # Capacity/telemetry ledger (entropy-based capacity signal)
+        self.ledger = CapacityLedger(vocab_size=cfg.vocab_size, ema_alpha=0.9)
 
     @torch.no_grad()
     def _shape_windows(self, h: torch.Tensor) -> Tuple[torch.Tensor, int, int, int, int]:
@@ -426,8 +438,10 @@ class ContinuousLM(nn.Module):
 
         Returns:
             logits: [B, T, V]
-            y_win_bnwd: [B, n_win, W, D]   # hidden by windows
+            y_win_bnwd: [B, n_win, W, D]   # post-integration hidden by windows
             logits_win: Optional [B, n_win, W, V]  # logits per window if stitching KL is enabled
+            h_pre: [B, T, D]  # pre-integration (Chebyshev) hidden, reconstructed
+            h_post: [B, T, D] # post-integration hidden, reconstructed
         """
         # 1) Embed tokens -> [B, T, D]
         h0 = self.embed(tokens)
@@ -451,35 +465,40 @@ class ContinuousLM(nn.Module):
         if use_border_only:
             # no-grad bulk
             with torch.no_grad():
-                y_ng = self.block(xw, step_hook=integ_hook)  # [B*nw, W, D]
+                y_post_ng, y_pre_ng = self.block(xw, step_hook=integ_hook)  # [B*nw, W, D], [B*nw, W, D]
             # grad pass
-            y_g = self.block(xw, step_hook=integ_hook)      # [B*nw, W, D]
+            y_post_g, y_pre_g = self.block(xw, step_hook=integ_hook)      # [B*nw, W, D], [B*nw, W, D]
             # compose: bulk from no-grad, collars from grad
-            y = y_ng.detach().clone()
+            y_post = y_post_ng.detach().clone()
+            y_pre = y_pre_ng.detach().clone()
             if O > 0:
-                y[:, :O, :] = y_g[:, :O, :]
-                y[:, W - O:, :] = y_g[:, W - O:, :]
+                y_post[:, :O, :] = y_post_g[:, :O, :]
+                y_post[:, W - O:, :] = y_post_g[:, W - O:, :]
+                y_pre[:, :O, :] = y_pre_g[:, :O, :]
+                y_pre[:, W - O:, :] = y_pre_g[:, W - O:, :]
 
             # optional refresh on drift
             if self.cfg.refresh_on_drift:
-                bulk = y_ng[:, O:W - O, :]
-                coll = torch.cat([y_g[:, :O, :], y_g[:, W - O:, :]], dim=1)
+                bulk = y_post_ng[:, O:W - O, :]
+                coll = torch.cat([y_post_g[:, :O, :], y_post_g[:, W - O:, :]], dim=1)
                 drift = (bulk.mean() - coll.mean()).abs().item()
                 if drift > float(self.cfg.drift_thresh):
-                    y = y_g
+                    y_post = y_post_g
+                    y_pre = y_pre_g
         else:
             # full-grad path
-            y = self.block(xw, step_hook=integ_hook)
+            y_post, y_pre = self.block(xw, step_hook=integ_hook)
 
-        # 3) Save hidden by window for stitching
-        y_win_bnwd = y.view(B, nwin, W, D)  # [B, n_win, W, D]
+        # 3) Save hidden by window for stitching (post-integration)
+        y_win_bnwd = y_post.view(B, nwin, W, D)  # [B, n_win, W, D]
 
-        # 4) Reconstruct sequence and project to vocab
-        h_full = self._unshape_and_reconstruct(y, B, T, D, nwin)        # [B, T, D]
-        logits = self.head(h_full, mask=None, mask_behavior="none", traceless=True)  # [B, T, V]
+        # 4) Reconstruct sequences (both post and pre states)
+        h_post = self._unshape_and_reconstruct(y_post, B, T, D, nwin)        # [B, T, D]
+        h_pre  = self._unshape_and_reconstruct(y_pre,  B, T, D, nwin)        # [B, T, D]
+        logits = self.head(h_post, mask=None, mask_behavior="none", traceless=True)  # [B, T, V]
 
         # 5) Optional debug (state norms / CE alignment)
-        self._maybe_debug_state(h_full, logits, tokens, mask)
+        self._maybe_debug_state(h_post, logits, tokens, mask)
 
         # 6) Prepare logits per window if SKL is enabled
         logits_win = None
@@ -487,7 +506,31 @@ class ContinuousLM(nn.Module):
             log_w = slice_windows(logits, self.cfg.W, self.cfg.O, axis=1, pad=True)  # [B, V, n_win, W]
             logits_win = log_w.permute(0, 2, 3, 1).contiguous()  # [B, n_win, W, V]
 
-        return logits, y_win_bnwd, logits_win
+        return logits, y_win_bnwd, logits_win, h_pre, h_post
+    def _state_loss(self, h_pre: torch.Tensor, h_post: torch.Tensor, mask_bt: torch.Tensor, kind: str = "energy_contract") -> Tuple[torch.Tensor, Dict[str, float]]:
+        # h_pre, h_post: [B, T, D]; mask_bt: [B, T] bool
+        # energy per token = ||h||^2 along channel dim
+        e_pre = (h_pre * h_pre).sum(dim=-1)              # [B, T]
+        e_post = (h_post * h_post).sum(dim=-1)           # [B, T]
+        # relative positive increase (contractive w.r.t. energy)
+        rel_increase = (e_post - e_pre) / (e_pre + 1e-8)
+        pen = torch.relu(rel_increase)
+        if mask_bt is not None:
+            pen = pen[mask_bt]
+            e_pre_m = e_pre[mask_bt]
+            e_post_m = e_post[mask_bt]
+        else:
+            e_pre_m = e_pre.reshape(-1)
+            e_post_m = e_post.reshape(-1)
+        if pen.numel() > 0:
+            loss_state = pen.mean()
+            H_pre = float(e_pre_m.mean().detach().item())
+            H_post = float(e_post_m.mean().detach().item())
+            dH_pos = float(torch.relu(e_post_m - e_pre_m).mean().detach().item())
+        else:
+            loss_state = pen.sum() * 0.0
+            H_pre = H_post = dH_pos = 0.0
+        return loss_state, {"H_pre": H_pre, "H_post": H_post, "dH_pos": dH_pos}
 
     def _build_collar_seq_mask(self, B: int, T: int, device, dtype=torch.bool):
         """
@@ -526,9 +569,15 @@ class ContinuousLM(nn.Module):
             y: torch.Tensor = batch["y"]
             mask: Optional[torch.Tensor] = batch.get("mask", None)
 
-            logits, y_win, logits_win = self.forward_tokens(x, mask)  # [B,T,V]
+            logits, y_win, logits_win, h_pre, h_post = self.forward_tokens(x, mask)  # [B,T,V], ...
             B, T, V = logits.shape
             assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
+
+            # Ledger update on valid tokens (pads excluded)
+            valid_mask = (y != pad_id)
+            if mask is not None:
+                valid_mask = valid_mask & mask.bool()
+            led_stats = self.ledger.update(logits=logits, mask=valid_mask, loss=None)
 
             # Collar-only loss logic
             use_collar_ce = self.training and self.cfg.grads_border_only and (self.cfg.O > 0) and (self.cfg.W > 2 * self.cfg.O)
@@ -540,6 +589,21 @@ class ContinuousLM(nn.Module):
             if use_collar_ce:
                 collar_mask = self._build_collar_seq_mask(B, T, logits.device)
                 sup_mask = sup_mask & collar_mask
+            # Build mask for state regularizer
+            if self.cfg.state_mask.lower() == "collar":
+                collar_mask = self._build_collar_seq_mask(B, T, logits.device)
+                state_mask_bt = collar_mask
+            else:
+                state_mask_bt = torch.ones(B, T, dtype=torch.bool, device=logits.device)
+            # Also exclude PADs/right-padding using the available supervision mask logic
+            if 'y' in locals():
+                state_mask_bt = state_mask_bt & (y != pad_id)
+                if mask is not None:
+                    state_mask_bt = state_mask_bt & mask.bool()
+            elif 'targets_s' in locals():
+                # legacy path uses original mask (pre-shift) if available
+                if mask is not None:
+                    state_mask_bt = state_mask_bt & mask.bool()
             # Extra alignment check (masked fraction only as info)
             if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
                 with torch.no_grad():
@@ -568,13 +632,19 @@ class ContinuousLM(nn.Module):
 
             stats: Dict[str, float] = {"acc": acc, "bpp": bpp_val, "tokens": float(sup_mask.sum().item())}
 
+            if led_stats:
+                # keep only plain floats
+                for k, v in led_stats.items():
+                    if isinstance(v, (int, float)):
+                        stats[k] = float(v)
+
         else:
             # Legacy path: accept 'tokens' and perform shift inside
             tokens: torch.Tensor = batch["tokens"]
             mask: Optional[torch.Tensor] = batch.get("mask", None)
             targets: Optional[torch.Tensor] = batch.get("targets", None)
 
-            logits, y_win, logits_win = self.forward_tokens(tokens, mask)
+            logits, y_win, logits_win, h_pre, h_post = self.forward_tokens(tokens, mask)
             if targets is None:
                 targets = tokens  # teacher forcing baseline
 
@@ -582,6 +652,12 @@ class ContinuousLM(nn.Module):
             logits_s, targets_s, mask_s = shift_for_next_token(logits, targets, mask=mask)
             B, T, V = logits_s.shape
             assert V == self.cfg.vocab_size, f"head_dim(V)={V} != cfg.vocab_size={self.cfg.vocab_size}"
+
+            # Ledger update on valid tokens (pads excluded)
+            valid_mask = (targets_s != pad_id)
+            if mask_s is not None:
+                valid_mask = valid_mask & mask_s.bool()
+            led_stats = self.ledger.update(logits=logits_s, mask=valid_mask, loss=None)
 
             use_collar_ce = self.training and self.cfg.grads_border_only and (self.cfg.O > 0) and (self.cfg.W > 2 * self.cfg.O)
             # Build supervision mask: start from mask_s or all ones, AND with (targets_s != pad_id)
@@ -592,6 +668,21 @@ class ContinuousLM(nn.Module):
             if use_collar_ce:
                 collar_mask = self._build_collar_seq_mask(B, T, logits_s.device)
                 sup_mask = sup_mask & collar_mask
+            # Build mask for state regularizer
+            if self.cfg.state_mask.lower() == "collar":
+                collar_mask = self._build_collar_seq_mask(B, T, logits_s.device)
+                state_mask_bt = collar_mask
+            else:
+                state_mask_bt = torch.ones(B, T, dtype=torch.bool, device=logits_s.device)
+            # Also exclude PADs/right-padding using the available supervision mask logic
+            if 'y' in locals():
+                state_mask_bt = state_mask_bt & (y != pad_id)
+                if mask is not None:
+                    state_mask_bt = state_mask_bt & mask.bool()
+            elif 'targets_s' in locals():
+                # legacy path uses original mask (pre-shift) if available
+                if mask is not None:
+                    state_mask_bt = state_mask_bt & mask.bool()
             # Extra alignment check (masked fraction only as info)
             if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
                 with torch.no_grad():
@@ -617,6 +708,12 @@ class ContinuousLM(nn.Module):
             bpp_val = float(bpp_tensor.detach().item())
 
             stats = {"acc": acc, "bpp": bpp_val, "tokens": float(sup_mask.sum().item())}
+
+            if led_stats:
+                # keep only plain floats
+                for k, v in led_stats.items():
+                    if isinstance(v, (int, float)):
+                        stats[k] = float(v)
 
         # Optional stitching loss on overlaps (mask pads/right-padding)
         if self.stitch is not None and (self.cfg.O > 0):
@@ -654,6 +751,16 @@ class ContinuousLM(nn.Module):
                 loss = loss + self.cfg.stitch_w * st_total
                 stats.update({"loss_stitch": float(st_total.detach().item()), "stitch_w": float(self.cfg.stitch_w)})
                 stats.update(st_stats)
+
+        # State regularizer (energy non-expansion, contractive penalty)
+        if float(self.cfg.state_w) > 0.0:
+            l_state, st_e = self._state_loss(h_pre, h_post, state_mask_bt, kind=self.cfg.state_kind)
+            loss = loss + float(self.cfg.state_w) * l_state
+            stats.update({
+                "loss_state": float(l_state.detach().item()),
+                "state_w": float(self.cfg.state_w),
+                **st_e,
+            })
 
         # Dual penalty in log-space with variance-aware normalization (unchanged)
         if self.sda is not None and ("bpp" in stats):

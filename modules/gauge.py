@@ -52,6 +52,7 @@ class WeylGauge(nn.Module):
         h:   [B, T, D]
         cap: [B, T], [B, T, 1], or [B, T, groups]
         out: [B, T, D]
+        mask: [B, T], [B, T, 1], [B, T, groups], or [B, T, D] (bool or 0/1). False = invalid/pad/future.
     """
     def __init__(
         self,
@@ -145,7 +146,39 @@ class WeylGauge(nn.Module):
             return cap_g.permute(0, 2, 1).contiguous()     # [B, groups, T]
         raise ValueError(f"cap last dim must be 1, groups={self.groups}, or D={self.d}. Got {C}.")
 
-    def compute_scale(self, cap: torch.Tensor, detach: Optional[bool] = None) -> torch.Tensor:
+    def _mask_to_groups(self, mask: Optional[torch.Tensor], T: int, B: int) -> Optional[torch.Tensor]:
+        """
+        Normalize a mask to shape [B, groups, T] (bool).
+        Accepts:
+            [B, T]            -> expand to [B, T, groups]
+            [B, T, 1]         -> squeeze -> expand to groups
+            [B, T, groups]    -> permute to [B, groups, T]
+            [B, T, D]         -> reshape to [B, T, groups, group_size] and all() over channels
+        Returns None if mask is None.
+        """
+        if mask is None:
+            return None
+        if mask.dim() not in (2, 3):
+            raise ValueError("mask must have shape [B,T] or [B,T,C].")
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+        if mask.shape[0] != B or mask.shape[1] != T:
+            raise ValueError(f"mask shape must start with [B,T], got {tuple(mask.shape)}; expected B={B}, T={T}.")
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(-1)  # [B, T, 1]
+        C = mask.shape[-1]
+        if C == 1:
+            m_g = mask.expand(B, T, self.groups)              # [B, T, groups]
+            return m_g.permute(0, 2, 1).contiguous()          # [B, groups, T]
+        if C == self.groups:
+            return mask.permute(0, 2, 1).contiguous()         # [B, groups, T]
+        if C == self.d:
+            m4 = mask.view(B, T, self.groups, self.group_size)
+            m_g = m4.all(dim=-1)                              # [B, T, groups]
+            return m_g.permute(0, 2, 1).contiguous()          # [B, groups, T]
+        raise ValueError(f"mask last dim must be 1, groups={self.groups}, or D={self.d}. Got {C}.")
+
+    def compute_scale(self, cap: torch.Tensor, *, mask: Optional[torch.Tensor] = None, detach: Optional[bool] = None) -> torch.Tensor:
         """
         Turn capacity signal into per-feature scale s ∈ [smin, smax].
         Returns: s_full with shape [B, T, D].
@@ -162,6 +195,11 @@ class WeylGauge(nn.Module):
         # Normalize to per-group shape first to keep EMA shape stable across calls
         cap_g = self._capacity_to_groups(cap, T=T, B=B)     # [B, groups, T]
 
+        mask_g = self._mask_to_groups(mask, T=T, B=B)  # [B, groups, T] or None
+        if mask_g is not None:
+            # Zero-out invalid positions pre-EMA/conv so they don't leak through time via the kernel.
+            cap_g = cap_g * mask_g.to(cap_g.dtype)
+
         # Optional slow EMA across steps (stateful). This smooths capacity between calls.
         if self.cap_ema is not None:
             cap_g = self.cap_ema.update(cap_g.detach())
@@ -170,6 +208,11 @@ class WeylGauge(nn.Module):
         z = self.dw(cap_g)                                   # [B, groups, T]
         sigma = torch.sigmoid(z)                             # [B, groups, T]
         s_g = self.smin + (self.smax - self.smin) * sigma    # [B, groups, T]
+
+        if mask_g is not None:
+            # Force identity scale on invalid tokens
+            one_g = torch.ones_like(s_g)
+            s_g = torch.where(mask_g, s_g, one_g)
 
         # Optional stop-grad on scale
         use_detach = self.stopgrad_scale if detach is None else bool(detach)
@@ -209,7 +252,7 @@ class WeylGauge(nn.Module):
                 # Fallback: neutral capacity (no effect after identity init)
                 cap = torch.ones(h.size(0), h.size(1), 1, device=h.device, dtype=h.dtype)
 
-        s = self.compute_scale(cap, detach=detach_scale)  # [B, T, D]
+        s = self.compute_scale(cap, mask=mask, detach=detach_scale)  # [B, T, D]
         return h * s
 
 
@@ -225,6 +268,14 @@ if __name__ == "__main__":
     h = torch.randn(B, T, D)
     cap = torch.rand(B, T, 1)
     y = gauge(h, cap)
+
+    # Mask behavior: last 8 tokens invalid -> identity scaling there
+    mask = torch.ones(B, T, dtype=torch.bool)
+    mask[:, -8:] = False
+    cap_masked = torch.rand(B, T, 1)
+    y_masked = gauge(h, cap_masked, mask=mask)
+    assert torch.allclose(y_masked[:, -8:, :], h[:, -8:, :], atol=1e-6)
+
     diff = (y - h).abs().max().item()
     print(f"[gauge] identity init max|y-h| = {diff:.2e}")
     assert diff < 1e-5
@@ -234,6 +285,11 @@ if __name__ == "__main__":
     smin, smax = s.min().item(), s.max().item()
     print(f"[gauge] scale range = [{smin:.3f}, {smax:.3f}]")
     assert smin >= gauge.smin - 1e-5 and smax <= gauge.smax + 1e-5
+
+    s_masked = gauge.compute_scale(cap, mask=mask)
+    # Scales at masked tail should be exactly 1
+    tail = s_masked[:, -8:, :].reshape(-1)
+    assert torch.allclose(tail, torch.ones_like(tail), atol=1e-6)
 
     # Stop-grad test: make the mapping non-trivial and ensure params don't get grads
     gauge2 = WeylGauge(d=D, groups=G, ksize=3, smin=0.5, smax=2.0, init_identity=False, use_ema=True, ema_alpha=0.9, stopgrad_scale=True)
@@ -267,5 +323,8 @@ if __name__ == "__main__":
     diff3 = (y3 - h).abs().max().item()
     print(f"[gauge] internal-cap path max|y-h| = {diff3:.2e}")
     assert diff3 < 1e-5
+
+    y3m = gauge(h, logits=logits_rand, cap_kind="group", smooth_alpha=0.0, mask=mask)
+    assert torch.allclose(y3m[:, -8:, :], h[:, -8:, :], atol=1e-6)
 
     print("[gauge] All good ✓")

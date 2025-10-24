@@ -3,7 +3,7 @@
 # NumPy/Torch agnostic + Torch nn.Module for groupwise normalization.
 
 from __future__ import annotations
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 import warnings
 
 # Optional backends
@@ -46,26 +46,61 @@ def _rms_last(x: Any, eps: float) -> Any:
     if _is_numpy(x): return _np.sqrt(_np.mean(x * x, axis=-1, keepdims=True) + eps)
     return _torch.sqrt(_torch.mean(x * x, dim=-1, keepdim=True) + eps)
 
+def _apply_mask_along_axis(y: Any, mask: Any, axis: int) -> Any:
+    """
+    Multiply `y` by a boolean `mask` broadcast along `axis`.
+    If `mask` has one fewer dimension than `y`, a singleton is inserted at `axis`.
+    Returns `y` unchanged if `mask` is None.
+    """
+    if mask is None:
+        return y
+    # Normalize axis to be non-negative
+    ax = axis if axis >= 0 else (y.ndim + axis)
+    if _is_numpy(y):
+        m = mask
+        if m.dtype != bool:
+            m = m.astype(bool)
+        if m.ndim == y.ndim - 1:
+            m = _np.expand_dims(m, ax)
+        return y * m
+    else:
+        m = mask
+        if m.dtype != _torch.bool:
+            m = m.to(_torch.bool)
+        if m.ndim == y.ndim - 1:
+            m = m.unsqueeze(ax)
+        return y * m.to(dtype=y.dtype)
+
 
 # ------------------------------ public API -----------------------------------
 
-def traceless(x: Any, *, axis: int = -1) -> Any:
-    """Subtract the mean along `axis` (shape preserved)."""
+def traceless(x: Any, *, axis: int = -1, mask: Optional[Any] = None) -> Any:
+    """Subtract the mean along `axis` (shape preserved).
+    mask: optional boolean mask broadcast along `axis`; masked positions are zeroed in the output.
+    """
     x_last = _move_axis(x, axis, -1)
     y = x_last - _mean_last(x_last)
-    return _move_axis(y, -1, axis)
+    y = _move_axis(y, -1, axis)
+    y = _apply_mask_along_axis(y, mask, axis)
+    return y
 
 
-def normalize_rms(x: Any, *, axis: int = -1, eps: float = 1e-6) -> Any:
-    """LayerNorm-like (no affine): y = (x - mean)/rms along `axis`."""
+def normalize_rms(x: Any, *, axis: int = -1, eps: float = 1e-6, mask: Optional[Any] = None) -> Any:
+    """LayerNorm-like (no affine): y = (x - mean)/rms along `axis`.
+    mask: optional boolean mask broadcast along `axis`; masked positions are zeroed in the output.
+    """
     x_last = _move_axis(x, axis, -1)
     xc = x_last - _mean_last(x_last)
     y = xc / _rms_last(xc, eps)
-    return _move_axis(y, -1, axis)
+    y = _move_axis(y, -1, axis)
+    y = _apply_mask_along_axis(y, mask, axis)
+    return y
 
 
-def groupwise_traceless(x: Any, *, groups: int, axis: int = -1) -> Any:
-    """Subtract per-group mean within the feature axis."""
+def groupwise_traceless(x: Any, *, groups: int, axis: int = -1, mask: Optional[Any] = None) -> Any:
+    """Subtract per-group mean within the feature axis.
+    mask: optional boolean mask broadcast along `axis`; masked positions are zeroed in the output.
+    """
     x_last = _move_axis(x, axis, -1)              # [..., C]
     C = x_last.shape[-1]
     _ensure_divisible(C, groups)
@@ -82,15 +117,18 @@ def groupwise_traceless(x: Any, *, groups: int, axis: int = -1) -> Any:
         yg = xg - mu
         y = yg.view(*x_last.shape[:-1], C)
 
-    return _move_axis(y, -1, axis)
+    y = _move_axis(y, -1, axis)
+    y = _apply_mask_along_axis(y, mask, axis)
+    return y
 
 
 def groupwise_norm(
-    x: Any, *, groups: int, axis: int = -1, eps: float = 1e-6, return_stats: bool = False
+    x: Any, *, groups: int, axis: int = -1, eps: float = 1e-6, return_stats: bool = False, mask: Optional[Any] = None
 ) -> Any | Tuple[Any, Any, Any]:
     """
     Groupwise traceless + RMS normalization along `axis`.
     Returns `y` and optionally `(mu_full, r_full)` broadcast to `x`'s shape.
+    mask: optional boolean mask broadcast along `axis`; masked positions are zeroed in the output.
     """
     x_last = _move_axis(x, axis, -1)              # [..., C]
     C = x_last.shape[-1]
@@ -105,6 +143,7 @@ def groupwise_norm(
         yg = xc / r                                                      # [..., g, cg]
         y_last = yg.reshape(*x_last.shape[:-1], C)
         y = _move_axis(y_last, -1, axis)
+        y = _apply_mask_along_axis(y, mask, axis)
 
         if return_stats:
             mu_last = _np.broadcast_to(mu, (*x_last.shape[:-1], g, cg)).reshape(*x_last.shape[:-1], C)
@@ -122,6 +161,7 @@ def groupwise_norm(
         yg = xc / r                                                      # [..., g, cg]
         y_last = yg.view(*x_last.shape[:-1], C)
         y = _move_axis(y_last, -1, axis)
+        y = _apply_mask_along_axis(y, mask, axis)
 
         if return_stats:
             mu_last = mu.expand(*x_last.shape[:-1], g, cg).reshape(*x_last.shape[:-1], C)
@@ -141,6 +181,7 @@ if _HAVE_TORCH:
         Notes:
           - Default affine=False to match v3 (no extra params for offsets).
           - `traceless_freq` placeholder for future frequency-domain extension.
+          - Optional boolean mask to zero-out padded tokens (broadcast on last dim).
         """
         def __init__(
             self,
@@ -170,7 +211,7 @@ if _HAVE_TORCH:
                 self.register_parameter("weight", None)
                 self.register_parameter("bias", None)
 
-        def forward(self, x: _torch.Tensor) -> _torch.Tensor:
+        def forward(self, x: _torch.Tensor, mask: Optional[_torch.Tensor] = None) -> _torch.Tensor:
             C = x.shape[-1]
             if C != self.num_features:
                 raise ValueError(f"Expected last dim {self.num_features}, got {C}.")
@@ -186,6 +227,7 @@ if _HAVE_TORCH:
                 w = self.weight.view(*((1,) * (y.ndim - 1)), -1)
                 b = self.bias.view(*((1,) * (y.ndim - 1)), -1)
                 y = y * w + b
+            y = _apply_mask_along_axis(y, mask, axis=-1)
             return y
 else:
     class GroupwiseTracelessNorm:  # type: ignore
@@ -222,6 +264,12 @@ if __name__ == "__main__":
         print(f"  NumPy: traceless max|mu_g|={float(_np.max(_np.abs(mu_g2))):.2e}")
         assert float(_np.max(_np.abs(mu_g2))) < 1e-12
 
+        # Mask-gating check (NumPy): zero-out last two time positions
+        m_np = _np.ones((3, 5), dtype=bool)
+        m_np[:, -2:] = False
+        y_masked = groupwise_norm(x, groups=4, axis=-1, eps=0.0, return_stats=False, mask=m_np)
+        assert _np.allclose(y_masked[:, -2:, :], 0.0)
+
     # Torch checks (if available)
     if _HAVE_TORCH:
         gen = _torch.Generator().manual_seed(0)
@@ -245,5 +293,11 @@ if __name__ == "__main__":
         err = float((y_t - y_ref).abs().max())
         print(f"  Torch: core max|Δ| = {err:.2e}")
         assert err < 1e-6
+
+        # Mask-gating check (Torch)
+        m_t = _torch.ones((2, 7), dtype=_torch.bool)
+        m_t[:, -3:] = False
+        y_t2 = mod(x_t, mask=m_t)
+        assert float(y_t2[:, -3:, :].abs().max()) == 0.0
 
     print("[normalize] All good ✓")

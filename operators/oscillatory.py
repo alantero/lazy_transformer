@@ -17,6 +17,8 @@
 #     • 'path'  (Dirichlet-style) BCs using one-sided stencils at boundaries
 # - Groupwise parameters: c_g and ω_g (shape [groups])
 # - Stable defaults: c=0, ω=0 → zero operator (lazy minimal start)
+# - Optional causal/backward 2nd-derivative stencil (no future lookahead)
+# - Per-token mask support to gate PAD tokens
 #
 # Shapes
 # ------
@@ -73,6 +75,25 @@ def _diff2_central(x: Tensor, *, bc: _BC, dx: float) -> Tensor:
         raise ValueError("bc must be 'cycle' or 'path'.")
 
 
+def _diff2_backward(x: Tensor, *, dx: float) -> Tensor:
+    """
+    Causal/backward second derivative along axis=1 (time):
+    uses x[t] - 2*x[t-1] + x[t-2] over dx^2.
+    For t<2, returns 0 (no future lookahead, strict causality).
+    Shape preserved.
+    """
+    if x.dim() < 2:
+        raise ValueError("x must be at least [B,T,...].")
+    if dx <= 0:
+        raise ValueError("dx must be > 0.")
+    B, T = x.shape[:2]
+    y = torch.zeros_like(x)
+    if T >= 3:
+        y[:, 2:, ...] = (x[:, 2:, ...] - 2.0 * x[:, 1:-1, ...] + x[:, :-2, ...]) / (dx * dx)
+    # t=0,1 remain zero → strictly causal
+    return y
+
+
 class Oscillatory1D(nn.Module):
     """
     y = (c^2) * ∂_t^2 x  -  (ω^2) * x   (per group, broadcast to channels).
@@ -87,6 +108,11 @@ class Oscillatory1D(nn.Module):
 
     Forward:
       x [B,T,D] → y [B,T,D]
+      mask (optional) gates updates per token; causal=True uses backward stencil (no future).
+
+    Additional Parameters:
+      mask: Optional tensor [B,T] gating updates per token (e.g. PAD tokens)
+      causal: bool, if True uses backward stencil (no future lookahead)
     """
     def __init__(
         self,
@@ -159,7 +185,7 @@ class Oscillatory1D(nn.Module):
         else:
             self.omega.copy_(vec)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask: torch.Tensor | None = None, *, causal: bool = False) -> Tensor:
         """
         Apply oscillatory operator. x: [B,T,D] -> y: [B,T,D]
         """
@@ -172,12 +198,23 @@ class Oscillatory1D(nn.Module):
         # reshape to [B,T,G,Cg] for groupwise scalars
         xg = x.view(B, T, g, cg)
 
-        lap = _diff2_central(xg, bc=self.bc, dx=self.dx)          # ∂^2_t x
+        if causal:
+            lap = _diff2_backward(xg, dx=self.dx)
+        else:
+            lap = _diff2_central(xg, bc=self.bc, dx=self.dx)
+
         c2 = (self.c.view(1, 1, g, 1).to(x) ** 2)                 # [1,1,G,1]
         w2 = (self.omega.view(1, 1, g, 1).to(x) ** 2)             # [1,1,G,1]
 
         yg = c2 * lap - w2 * xg
         y = yg.view(B, T, D)
+
+        if mask is not None:
+            if mask.dim() != 2 or mask.shape[0] != B or mask.shape[1] != T:
+                raise ValueError(f"mask must be [B,T], got {tuple(mask.shape)}")
+            m = mask.to(dtype=y.dtype, device=y.device).view(B, T, 1)
+            y = y * m  # zero update on PAD tokens → identity over PAD downstream
+
         return y
 
 
@@ -230,5 +267,16 @@ if __name__ == "__main__":
     rel_int = abs_int / scale_int
     print(f"  path:     max interior |Δ lap| = {abs_int:.2e} (rel={rel_int:.3e})")
     assert rel_int < 2e-2, "Interior relative error should be <2%."
+
+    # --- Causal/backward: first two positions must be zero
+    y_causal = Oscillatory1D(d_model=D, groups=G, bc="cycle", dx=dt, learn_c=False, learn_omega=False, c_init=1.0, omega_init=0.0)(x, causal=True)
+    assert torch.allclose(y_causal[:, :2, :], torch.zeros_like(y_causal[:, :2, :])), "Causal stencil must not use future (t<2 zero)."
+
+    # --- Mask gating: last quarter masked → zero update there
+    mask = torch.ones((B, N), dtype=torch.bool)
+    mask[:, -N//4:] = False
+    osc_mask = Oscillatory1D(d_model=D, groups=G, bc="cycle", dx=dt, learn_c=False, learn_omega=False, c_init=1.0, omega_init=0.0)
+    y_masked = osc_mask(x, mask=mask)
+    assert (y_masked[:, -N//4:, :].abs().max() < 1e-8), "Masked positions must have zero update."
 
     print("[oscillatory] All good ✓")

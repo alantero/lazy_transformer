@@ -89,7 +89,7 @@ class Integrator(nn.Module):
             raise ValueError(f"field returned shape {tuple(out.shape)}, expected {tuple(h.shape)}.")
         return out
 
-    def _call_hook(self, hook, s: int, name: str, x: Tensor, x_next: Tensor, dt_eff: float, k_rms: Optional[float] = None) -> None:
+    def _call_hook(self, hook, s_idx: int, name: str, x: Tensor, x_next: Tensor, dt_eff: float, k_rms: Optional[float] = None) -> None:
         """Safely invoke optional per-step hook for logging/diagnostics.
         Never raises; computes simple RMS-based stats.
         """
@@ -102,7 +102,7 @@ class Integrator(nn.Module):
                 dx_rms = _rms(dx).item()
                 k_est_rms = (dx_rms / (abs(dt_eff) + 1e-12)) if dt_eff != 0.0 else 0.0
                 payload = {
-                    "step": int(s),
+                    "step": int(s_idx),
                     "method": str(name),
                     "dt_eff": float(dt_eff),
                     "x_rms": float(x_rms),
@@ -117,14 +117,14 @@ class Integrator(nn.Module):
 
     # --------------------------------- steps ----------------------------------
 
-    def _step_euler(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
+    def _step_euler(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
         dt1, k1_r = self._guard_dt(k1, dt)
         out = h + dt1 * k1
-        self._call_hook(hook, s, "euler", h, out, dt1, k1_r)
+        self._call_hook(hook, s_idx, "euler", h, out, dt1, k1_r)
         return out
 
-    def _step_heun(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
+    def _step_heun(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
         dt1, k1_r = self._guard_dt(k1, dt)
         h1 = h + dt1 * k1
@@ -132,10 +132,10 @@ class Integrator(nn.Module):
         k_avg = 0.5 * (k1 + k2)
         dt2, k_avg_r = self._guard_dt(k_avg, dt)
         out = h + dt2 * k_avg
-        self._call_hook(hook, s, "heun", h, out, dt2, k_avg_r)
+        self._call_hook(hook, s_idx, "heun", h, out, dt2, k_avg_r)
         return out
 
-    def _step_rk4(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
+    def _step_rk4(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
         k1 = self._f(h, **kw)
         dt_eff, k1_r = self._guard_dt(k1, dt)
         k2 = self._f(h + 0.5 * dt_eff * k1, **kw)
@@ -143,7 +143,7 @@ class Integrator(nn.Module):
         k4 = self._f(h + dt_eff * k3, **kw)
         out = h + (dt_eff / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         # Use k1 RMS as a proxy for logging
-        self._call_hook(hook, s, "rk4", h, out, dt_eff, k1_r)
+        self._call_hook(hook, s_idx, "rk4", h, out, dt_eff, k1_r)
         return out
 
     # ------------------------- ETD–symplectic step ----------------------------
@@ -152,7 +152,7 @@ class Integrator(nn.Module):
     #   (i) Dissipative ETD: y <- exp(-dt * R) (G h)  [exact for diagonal R; low-rank part first-order]
     #  (ii) Skew "wave" step for J via midpoint/leapfrog: y <- y + dt * J(y + 0.5 dt J y)
     # If the field doesn't expose the needed hooks, we gracefully fall back to Heun.
-    def _step_etd_symplectic(self, h: Tensor, dt: float, s: int, hook=None, **kw) -> Tensor:
+    def _step_etd_symplectic(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
         f = self.field
         # Check duck-typed hooks
         hasG = _has_attr(f, "_apply_G")
@@ -160,7 +160,7 @@ class Integrator(nn.Module):
         hasJ = _has_attr(f, "_apply_J")
         if not (hasG and hasR and hasJ):
             # Fallback
-            return self._step_heun(h, dt, s, hook, **kw)
+            return self._step_heun(h, dt, s_idx, hook, **kw)
 
         B, T, D = h.shape
         y = h.view(B * T, D)  # flatten for last-dim linear ops
@@ -186,8 +186,8 @@ class Integrator(nn.Module):
         if getattr(f, "use_diag_R", False) and hasattr(f, "rho"):
             diag = F.softplus(getattr(f, "rho"))  # [D]
             if torch.is_tensor(diag) and diag.dim() == 1 and diag.numel() == D:
-                s = torch.exp(-dt * R_scale * (diag + getattr(f, "eps", 0.0)))
-                y = y * s  # exact ETD for diag
+                decay = torch.exp(-dt * R_scale * (diag + getattr(f, "eps", 0.0)))
+                y = y * decay  # exact ETD for diag
                 used_exact_diag = True
 
         # (i-b) Low-rank part:
@@ -206,7 +206,7 @@ class Integrator(nn.Module):
         y = y + dt * Jy_mid
 
         out = y.view(B, T, D)
-        self._call_hook(hook, s, "etd-symplectic", h, out, dt, None)
+        self._call_hook(hook, s_idx, "etd-symplectic", h, out, dt, None)
         return out
 
     # -------------------------------- forward ---------------------------------

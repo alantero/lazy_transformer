@@ -19,6 +19,8 @@
 # - Efficient computation via two small GEMMs per group using einsum; no need
 #   to form the full D×D matrix on forward. A helper builds the full matrix for
 #   debugging/tests if desired.
+# - Accepts optional mask [B,T] (bool) to gate updates/bias on padded positions,
+#   preserving causal semantics (operator is per-time-step and does not look ahead).
 
 from __future__ import annotations
 from typing import Literal, Optional
@@ -122,15 +124,27 @@ class LowRankMix(nn.Module):
         y2   = torch.einsum("btgr,grc->btgc", tmp2, B.transpose(-1, -2))  # @ B^T -> [B,T,G,Cg]
         return y1 - y2
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
         x: [B, T, D] → y: [B, T, D]
+        mask: Optional[bool Tensor] of shape [B, T] to gate updates/bias on padded positions.
         """
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must be [B,T,{self.d_model}], got {tuple(x.shape)}")
 
         B, T, D = x.shape
         g, cg = self.groups, self.cg
+
+        if mask is not None:
+            if mask.shape != (B, T):
+                raise ValueError(f"mask must have shape [B, T], got {tuple(mask.shape)}")
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            m4 = mask.view(B, T, 1, 1)  # for gating updates on [B,T,G,Cg]
+            m3 = mask.view(B, T, 1)     # for gating bias on [B,T,D]
+        else:
+            m4 = None
+            m3 = None
 
         # Reshape features into groups for block-diagonal mixing
         xg = x.view(B, T, g, cg)  # [B,T,G,Cg]
@@ -142,11 +156,23 @@ class LowRankMix(nn.Module):
         else:  # "skew"
             yg = self._apply_skew(xg, self.A, self.B)     # type: ignore[arg-type]
 
+        if m4 is not None:
+            yg = yg * m4  # zero out updates at PAD positions
+
         # Scale (scalar) + optional bias
         # NOTE: einsum can produce a non-contiguous tensor; use reshape for safety.
         y = x + self.scale * yg.reshape(B, T, D)  # residual-style update
         if self.bias is not None:
-            y = y + self.bias.view(1, 1, D)
+            if m3 is None:
+                y = y + self.bias.view(1, 1, D)
+            else:
+                y = y + m3.to(y.dtype) * self.bias.view(1, 1, D)
+
+        if m3 is not None:
+            # Defensive: force PAD positions to original x (mask gates updates and bias anyway)
+            y = torch.where(m3, y, x)
+
+        # This operator is time-local (no future-peeking), mask only gates PADs.
         return y
 
     @torch.no_grad()
@@ -205,6 +231,12 @@ if __name__ == "__main__":
     print(f"  general: max|Δ| = {err:.2e}")
     assert err < 1e-6
 
+    # Masked test for general
+    mask = torch.ones(B, T, dtype=torch.bool)
+    mask[:, -2:] = False
+    y_mask = mod(x, mask=mask)
+    assert (y_mask[:, -2:] - x[:, -2:]).abs().max() == 0
+
     # --- Symmetric: check PSD and match explicit product
     sym = LowRankMix(d_model=D, rank=r, groups=G, kind="symmetric", bias=False, init_scale=0.01)
     with torch.no_grad():
@@ -220,6 +252,10 @@ if __name__ == "__main__":
     err2 = float((ys - y_ref).abs().max())
     print(f"  symmetric: max|Δ| = {err2:.2e}")
     assert err2 < 1e-6
+
+    # Masked test for symmetric
+    y_mask_sym = sym(x, mask=mask)
+    assert (y_mask_sym[:, -2:] - x[:, -2:]).abs().max() == 0
 
     # --- Skew: check antisymmetry and match explicit product
     sk = LowRankMix(d_model=D, rank=r, groups=G, kind="skew", bias=False, init_scale=0.01)

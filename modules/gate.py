@@ -15,6 +15,10 @@
 #   • Optional external capacity/context signal 'cap' (e.g., per-group or per-token) to bias gates.
 #       - Learnable scalar 'cap_scale' mixes the external signal into gate logits.
 #       - stop_grad_cap: if True (default), detach() the external 'cap' signal before mixing (no gradient through cap).
+#   • Optional boolean mask 'mask' marks valid positions; invalid positions pass through x unchanged.
+#       - mask supports shapes [B,T], [B,T,1], [B,T,G], [B,T,D].
+#       - For mode='residual', positions where mask==False pass x unchanged (g=0).
+#       - For mode='mul', positions where mask==False pass x unchanged (no multiplicative gating).
 #
 # No dependencies beyond torch.
 
@@ -59,6 +63,11 @@ class GroupGate(nn.Module):
         cap: Optional capacity/context signal. Supported shapes:
              [B, T], [B, T, 1], [B, T, G], [B, T, D]
              It is broadcast to [B, T, D] before contribution.
+        mask: Optional boolean mask marking valid positions.
+              Supported shapes: [B, T], [B, T, 1], [B, T, G], [B, T, D].
+              On positions where mask is False:
+                - mode='residual': y passes through x unchanged (since g=0 there).
+                - mode='mul': y equals x (no multiplicative suppression).
 
       Returns:
         y:   [B, T, D]
@@ -135,10 +144,33 @@ class GroupGate(nn.Module):
             raise ValueError(f"Unsupported cap last-dim {cap.shape[-1]} for D={self.d_model}, G={self.groups}.")
         return capD.to(device=device, dtype=dtype)
 
-    def _gate(self, B: int, T: int, device: torch.device, dtype: torch.dtype, cap: Optional[Tensor]) -> Tensor:
+    def _broadcast_mask(self, mask: Tensor, device: torch.device) -> Tensor:
+        """
+        Normalize boolean 'mask' into [B, T, D] (True=valid).
+        Supported shapes: [B,T], [B,T,1], [B,T,G], [B,T,D].
+        """
+        if mask.dim() not in (2, 3):
+            raise ValueError("mask must have shape [B,T], [B,T,1], [B,T,G], or [B,T,D].")
+        if mask.dim() == 2:  # [B,T]
+            mask = mask.unsqueeze(-1)  # [B,T,1]
+        B, T = mask.shape[:2]
+        if mask.shape[-1] == 1:
+            maskD = mask.expand(B, T, self.d_model)
+        elif mask.shape[-1] == self.groups:
+            # expand per-group to per-channel
+            maskG = mask
+            maskD = maskG.unsqueeze(-1).expand(B, T, self.groups, self.cg).reshape(B, T, self.d_model)
+        elif mask.shape[-1] == self.d_model:
+            maskD = mask
+        else:
+            raise ValueError(f"Unsupported mask last-dim {mask.shape[-1]} for D={self.d_model}, G={self.groups}.")
+        return maskD.to(device=device, dtype=torch.bool)
+
+    def _gate(self, B: int, T: int, device: torch.device, dtype: torch.dtype, cap: Optional[Tensor], mask: Optional[Tensor]) -> Tensor:
         """
         Build gate tensor g in [0,1] with shape [B, T, D].
         g = sigmoid( logit_scale * (logits_full + cap_scale * cap_full) )
+        If mask is provided (False=invalid), gates on invalid positions are zeroed.
         """
         if self.per_channel:
             logits_full = self.logits.to(device=device, dtype=dtype)                  # [D]
@@ -147,16 +179,26 @@ class GroupGate(nn.Module):
 
         logitsBTD = logits_full.view(1, 1, self.d_model).expand(B, T, self.d_model)  # [B,T,D]
 
+        maskD_bool: Optional[Tensor] = None
+        if mask is not None:
+            maskD_bool = self._broadcast_mask(mask, device=device)                   # [B,T,D] bool
+
         if cap is not None:
             if self.stop_grad_cap:
                 cap = cap.detach()
             capD = self._broadcast_cap(cap, device=device, dtype=dtype)              # [B,T,D]
+            if maskD_bool is not None:
+                capD = capD * maskD_bool.to(dtype)                                   # ignore cap on invalid tokens
             logitsBTD = logitsBTD + self.cap_scale.to(device=device, dtype=dtype) * capD
 
         g = torch.sigmoid(self.logit_scale.to(device=device, dtype=dtype) * logitsBTD)
+
+        if maskD_bool is not None:
+            g = g * maskD_bool.to(dtype)  # zero-out gates on invalid tokens
+
         return g
 
-    def forward(self, x: Tensor, u: Optional[Tensor] = None, *, cap: Optional[Tensor] = None, return_gate: bool = False):
+    def forward(self, x: Tensor, u: Optional[Tensor] = None, *, cap: Optional[Tensor] = None, mask: Optional[Tensor] = None, return_gate: bool = False):
         """
         See class docstring for details.
         """
@@ -166,12 +208,20 @@ class GroupGate(nn.Module):
             raise ValueError("For mode='residual', u must be provided with the same shape as x.")
 
         B, T, D = x.shape
-        g = self._gate(B, T, device=x.device, dtype=x.dtype, cap=cap)  # [B,T,D]
+        maskD_bool = self._broadcast_mask(mask, device=x.device) if mask is not None else None
+
+        g = self._gate(B, T, device=x.device, dtype=x.dtype, cap=cap, mask=mask)  # [B,T,D]
 
         if self.mode == "residual":
             y = x + g * u  # type: ignore[operator]
+            if maskD_bool is not None:
+                # residual form already leaves x unchanged when g==0; nothing else needed
+                pass
         else:  # 'mul'
-            y = g * x
+            if maskD_bool is not None:
+                y = torch.where(maskD_bool, g * x, x)
+            else:
+                y = g * x
 
         return (y, g) if return_gate else y
 
@@ -234,5 +284,21 @@ if __name__ == "__main__":
     gate_hi_mean = float(gate_hi[..., ch0].mean())
     print(f"  cap monotonicity (group 0): low={gate_low_mean:.3f}, high={gate_hi_mean:.3f}")
     assert gate_hi_mean > gate_low_mean, "Gate should increase when cap for the group increases."
+
+    # 4) Mask behavior: invalid positions pass through x unchanged
+    mask = torch.ones(B, T, 1, dtype=torch.bool)
+    mask[:, 0, :] = False  # first time-step invalid
+
+    # residual: y should equal x at masked positions even if gate would open
+    g_res = GroupGate(d_model=D, groups=G, mode="residual", per_channel=False, bias_init=+10.0)
+    y_res = g_res(x, u=u, mask=mask)
+    assert torch.allclose(y_res[:, 0, :], x[:, 0, :], atol=1e-6), "Residual gate must pass x through on masked positions."
+
+    # mul: y should equal x at masked positions even when gate is open
+    g_mul = GroupGate(d_model=D, groups=G, mode="mul", per_channel=True, bias_init=+10.0)
+    y_mul = g_mul(x, mask=mask)
+    assert torch.allclose(y_mul[:, 0, :], x[:, 0, :], atol=1e-6), "Mul gate must pass x through on masked positions."
+
+    print("  mask passthrough: OK")
 
     print("[gate] All good ✓")

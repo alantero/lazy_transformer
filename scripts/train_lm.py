@@ -365,31 +365,20 @@ def run_sanity_checks(model: torch.nn.Module, batch: Dict[str, torch.Tensor], cf
 
     uniq = int(torch.unique(targets).numel())
 
-    # --- Forward pass (no grad) on tokens/mask to get logits and the model-aligned labels ---
+    # --- Forward pass (no grad) on tokens/mask to get logits ---
     out = model.forward_tokens(tokens, mask)
-    # Unpack logits and optionally a candidate label window
+    # Unpack logits only; ignore any extra outputs
     if isinstance(out, (tuple, list)) and len(out) >= 1:
         logits = out[0]
-        candidate = out[1] if len(out) >= 2 else None
     else:
         logits = out
-        candidate = None
 
     B, T, V = logits.shape
     flat_logits = logits.reshape(B*T, V)
     flat_targets = targets.reshape(B*T)
 
-    # Decide aligned_y safely: must be Long dtype, 2D [B,T], and match shape
-    aligned_y = None
-    if candidate is not None:
-        try:
-            if isinstance(candidate, torch.Tensor) and candidate.dtype in (torch.long, torch.int64):
-                if candidate.dim() == 2 and candidate.shape[0] == B and candidate.shape[1] == T:
-                    aligned_y = candidate
-        except Exception:
-            aligned_y = None
-    if aligned_y is None:
-        aligned_y = targets  # fallback
+    # Aligned labels: use provided targets (run_sanity_checks uses next-token y)
+    aligned_y = targets
 
     # Aligned CE using the chosen labels
     ce_aligned = torch.nn.CrossEntropyLoss()(flat_logits, aligned_y.reshape(B*T)).item()
@@ -482,6 +471,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use-dual-rate", dest="use_dual_rate", action="store_true")
     p.add_argument("--no-use-dual-rate", dest="use_dual_rate", action="store_false")
     p.set_defaults(use_dual_rate=None)
+    p.add_argument("--target-bpp", dest="target_bpp", type=float, default=None,
+                   help="Target bits-per-token for the dual-rate penalty. If not set, the model defaults to ~0.6*log2(vocab_size). Use together with --use-dual-rate.")
     # Scheduler
     p.add_argument("--scheduler", dest="scheduler_name", type=str, default=None,
                    choices=["warmup_cosine", "warmup_linear", "noam", "plateau"])
@@ -536,6 +527,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--debug-topk", type=int, default=None,
                   help="If set, log top-k token ids/probs at last timestep during training.")
 
+    p.add_argument("--state-w", type=float, default=0.0,
+                   help="Peso del regularizador de no-expansión de energía de estado (0 = desactivado).")
+    p.add_argument("--state-mask", type=str, choices=["all", "collar"], default="all",
+                   help="Dónde aplicar el regularizador de estado: en todo ('all') o sólo en el collar ('collar').")
+    p.add_argument("--state-kind", type=str, default="energy_contract",
+                   help="Tipo de regularizador de estado. Por ahora: 'energy_contract'.")
+
+
     # Optional override for Chebyshev laplacian kind
     p.add_argument("--cheb-laplacian", dest="cheb_laplacian", type=str, default=None,
                   choices=["path_causal", "path", "cycle", "toeplitz"],
@@ -564,17 +563,20 @@ def evaluate_val_ce(model: torch.nn.Module, val_loader: DataLoader, pad_id: int)
         else:
             logits = out
         B, T, V = logits.shape
-        loss = torch.nn.functional.cross_entropy(
+        # Per-token CE (no reduction), then mask-out invalid positions before summing.
+        per_tok = torch.nn.functional.cross_entropy(
             logits.reshape(-1, V), y.reshape(-1),
             ignore_index=int(pad_id),
-            reduction="sum",
-        )
-        # count only valid (non-pad) targets, intersected with mask if provided
+            reduction="none",
+        ).view(B, T)
+        # valid positions: non-pad and (if provided) within mask
         valid = (y != int(pad_id))
         if mask is not None:
             valid = valid & mask
+        per_tok = per_tok * valid.to(per_tok.dtype)
+        batch_loss_sum = per_tok.sum()
         ntok = int(valid.sum().item())
-        total_loss += float(loss.item())
+        total_loss += float(batch_loss_sum.item())
         total_tok  += ntok
         pred = logits.argmax(-1)
         batch_acc = float((pred[valid] == y[valid]).float().mean().item()) if ntok > 0 else 0.0
@@ -599,17 +601,19 @@ def evaluate_val_ce_tqdm(model: torch.nn.Module, val_loader: DataLoader, pad_id:
             out = model.forward_tokens(x, mask)
             logits = out[0] if isinstance(out, (tuple, list)) else out
             B, T, V = logits.shape
-            loss = torch.nn.functional.cross_entropy(
+            # Per-token CE (no reduction), then apply mask before summing.
+            per_tok = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, V), y.reshape(-1),
                 ignore_index=int(pad_id),
-                reduction="sum",
-            )
-            # count only valid (non-pad) targets, intersected with mask if provided
+                reduction="none",
+            ).view(B, T)
             valid = (y != int(pad_id))
             if mask is not None:
                 valid = valid & mask
+            per_tok = per_tok * valid.to(per_tok.dtype)
+            batch_loss_sum = per_tok.sum()
             ntok = int(valid.sum().item())
-            total_loss += float(loss.item())
+            total_loss += float(batch_loss_sum.item())
             total_tok  += ntok
             pred = logits.argmax(-1)
             batch_acc = float((pred[valid] == y[valid]).float().mean().item()) if ntok > 0 else 0.0
@@ -701,6 +705,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         "cheb_laplacian": getattr(args, "cheb_laplacian", None),
         "dt": args.dt,
         "method": args.method,
+        "state_w": getattr(args, "state_w", None),
+        "state_mask": getattr(args, "state_mask", None),
+        "state_kind": getattr(args, "state_kind", None),
+        "target_bpp": getattr(args, "target_bpp", None),
     }
 
     # --- Determine base config source and merge order ---
@@ -754,6 +762,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         # Fix vocab_size/pad_id from meta.json or probe
         _maybe_fix_vocab_from_meta(cfg, args.train_npy)
+        # Sensible defaults unless user explicitly opted in via CLI:
+        if args.use_dual_rate is None:
+            cfg.use_dual_rate = False
+            logging.info("[cfg] use_dual_rate not specified; disabling by default for LM training to avoid bpp clamping.")
+        if args.grads_border_only is None:
+            cfg.grads_border_only = False
+            logging.info("[cfg] grads_border_only not specified; disabling by default (CE on all positions).")
         # Defensive assertion
         assert 0 <= int(cfg.pad_id) < int(cfg.vocab_size), f"pad_id {cfg.pad_id} must be within [0, vocab_size={cfg.vocab_size})"
         device = torch.device(cfg.device)
@@ -848,7 +863,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             autocast = _amp.autocast
             GradScaler = _amp.GradScaler
-        scaler = GradScaler("cuda", enabled=use_amp)
+        scaler = GradScaler(enabled=use_amp)
 
 
 
@@ -876,10 +891,25 @@ def main(argv: Optional[List[str]] = None) -> None:
             opt.zero_grad(set_to_none=True)
             with autocast("cuda", enabled=use_amp):
                 loss, stats = model(batch)  # ContinuousLM returns (loss, stats)
+
+            # Backward with gradient scaling (if AMP enabled)
             scaler.scale(loss).backward()
+
+            # IMPORTANT: unscale before clipping so the clip threshold is applied in true scale
+            if use_amp:
+                try:
+                    scaler.unscale_(opt)
+                except Exception:
+                    # If unscale is not available (e.g., Noop GradScaler), just continue
+                    pass
+
+            # Clip after unscale; 1.0 is conservative (adjust if needed)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # Optimizer step via scaler
             scaler.step(opt)
             scaler.update()
+
             stats = dict(stats)
             stats["loss"] = float(loss.item())
             return stats
@@ -927,8 +957,21 @@ def main(argv: Optional[List[str]] = None) -> None:
                 postfix["ce"] = f"{float(ce_val):.4f}"
             if st_val is not None:
                 postfix["stitch"] = f"{float(st_val):.4f}"
+            ls_val = stats.get("loss_state")
+            if ls_val is not None:
+                postfix["l_state"] = f"{float(ls_val):.4f}"
             if cfg.profile and tm is not None and tm.time_s > 0:
                 postfix["ips"] = f"{tm.ips:.1f}"
+            # Show dual-rate target if active
+            try:
+                if getattr(cfg, "use_dual_rate", False) and hasattr(model, "_sda_target"):
+                    if getattr(model, "_dual_use_log", True):
+                        bpp_tgt = math.exp(float(model._sda_target))
+                    else:
+                        bpp_tgt = float(model._sda_target)
+                    postfix["bpp_tgt"] = f"{bpp_tgt:.2f}"
+            except Exception:
+                pass
             pbar.set_postfix(postfix)
 
             # Checkpoints
@@ -969,7 +1012,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         model.eval()
         with torch.no_grad():
             ref = last_batch if last_batch is not None else next(iter(val_loader))
-            out = model.forward_tokens(ref["x"], ref.get("mask", None))
+            x = ref["x"].to(device, non_blocking=True)
+            m = ref.get("mask", None)
+            if m is not None:
+                m = m.to(device, non_blocking=True)
+            out = model.forward_tokens(x, m)
             logits = out[0] if isinstance(out, (tuple, list)) else out
             B, T, V = logits.shape
             print(f"[train] forward sanity: logits {B}x{T}x{V} ✓")
@@ -993,6 +1040,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         if getattr(cfg, "vocab_size", None) is None:
             cfg.vocab_size = int(vocab.size if 'vocab' in locals() else 128)
         assert 0 <= int(cfg.pad_id) < int(cfg.vocab_size), f"pad_id {cfg.pad_id} must be within [0, vocab_size={cfg.vocab_size})"
+        # Sensible defaults for text mode too
+        if args.use_dual_rate is None:
+            cfg.use_dual_rate = False
+            logging.info("[cfg] use_dual_rate not specified; disabling by default (text mode).")
+        if args.grads_border_only is None:
+            cfg.grads_border_only = False
+            logging.info("[cfg] grads_border_only not specified; disabling by default (text mode, CE on all positions).")
 
     # --- Model / Optim / Scheduler / Ckpt (text fallback) --------------------
     device = torch.device(cfg.device)
@@ -1108,8 +1162,21 @@ def main(argv: Optional[List[str]] = None) -> None:
             postfix["ce"] = f"{float(ce_val):.4f}"
         if st_val is not None:
             postfix["stitch"] = f"{float(st_val):.4f}"
+        ls_val = stats.get("loss_state")
+        if ls_val is not None:
+            postfix["l_state"] = f"{float(ls_val):.4f}"
         if cfg.profile and tm is not None and tm.time_s > 0:
             postfix["ips"] = f"{tm.ips:.1f}"
+        # Show dual-rate target if active
+        try:
+            if getattr(cfg, "use_dual_rate", False) and hasattr(model, "_sda_target"):
+                if getattr(model, "_dual_use_log", True):
+                    bpp_tgt = math.exp(float(model._sda_target))
+                else:
+                    bpp_tgt = float(model._sda_target)
+                postfix["bpp_tgt"] = f"{bpp_tgt:.2f}"
+        except Exception:
+            pass
         pbar_txt.set_postfix(postfix)
 
         ckpt_mgr.periodic_save(
