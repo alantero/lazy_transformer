@@ -11,6 +11,9 @@
 #   Input  mask: [B, T] (bool, optional) pads are zeroed in outputs and never used to form differences
 #   Output y: [B, T, D]
 #
+# Optional:
+#   An optional `ctx` dict can be supplied to `forward` or `op` for per-call overrides of mask, speed, scheme, and boundary conditions.
+#
 # Notas:
 #   - 'cycle': usamos roll (índices circulares). Para que el test periódico sea “limpio”,
 #     el mallado debe ser realmente periódico: t_k = k/T (no incluir el punto t=1).
@@ -47,6 +50,13 @@ class Advective1D(nn.Module):
     Forward Args:
       x: input tensor of shape [B, T, D]
       mask: optional attention/pad mask of shape [B, T] (bool). Pads are zeroed in outputs and never used to form differences.
+      ctx: optional dictionary for per-call overrides:
+          - mask: optional [B,T] bool mask (overrides `mask` arg if provided)
+          - speed_override: optional Tensor [G] or scalar to use instead of the module's learned speed
+          - speed_scale: optional Tensor [G] or scalar to multiply the effective speed for this call
+          - scheme: optional string 'central' or 'upwind' (per-call override)
+          - bc: optional string 'cycle' or 'path' (per-call override)
+          Note: these do not mutate module state; they are ephemeral per-call modifiers.
     """
     def __init__(
         self,
@@ -157,16 +167,55 @@ class Advective1D(nn.Module):
             diff = diff * mask.unsqueeze(-1).to(diff.dtype)
         return diff
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, mask: Tensor | None = None, ctx: dict | None = None) -> Tensor:
         """
         Apply advective operator. x: [B,T,D] -> y: [B,T,D]
 
         Args:
           x: input tensor [B, T, D]
           mask: optional attention/pad mask [B, T] bool, pads zeroed in output and never used to form differences
+          ctx: optional dictionary for per-call overrides:
+            - mask: optional [B,T] bool mask (overrides `mask` arg if provided)
+            - speed_override: optional Tensor [G] or scalar to use instead of the module's learned speed
+            - speed_scale: optional Tensor [G] or scalar to multiply the effective speed for this call
+            - scheme: optional string 'central' or 'upwind' (per-call override)
+            - bc: optional string 'cycle' or 'path' (per-call override)
+            Note: these do not mutate module state; they are ephemeral per-call modifiers.
         """
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must be [B,T,{self.d_model}], got {tuple(x.shape)}")
+
+        ctx = ctx or {}
+        if 'mask' in ctx and ctx['mask'] is not None:
+            mask = ctx['mask']
+        scheme = ctx.get('scheme', self.scheme)
+        bc = ctx.get('bc', self.bc)
+        # build effective speed vector [G]
+        if 'speed_override' in ctx and ctx['speed_override'] is not None:
+            v_g = ctx['speed_override']
+            if isinstance(v_g, (int, float)):
+                v_g = torch.full((self.groups,), float(v_g), dtype=torch.float32, device=self.speed.device)
+            else:
+                v_g = v_g.to(dtype=torch.float32, device=self.speed.device).view(-1)
+                if v_g.numel() == 1:
+                    v_g = torch.full((self.groups,), float(v_g.item()), dtype=torch.float32, device=self.speed.device)
+                elif v_g.shape != (self.groups,):
+                    raise ValueError(f"speed_override must be scalar or shape [{self.groups}], got {tuple(v_g.shape)}")
+        else:
+            v_g = self.speed.detach() if isinstance(self.speed, torch.Tensor) else torch.tensor(self.speed, dtype=torch.float32, device=x.device)
+        # apply optional scale
+        if 'speed_scale' in ctx and ctx['speed_scale'] is not None:
+            s = ctx['speed_scale']
+            if isinstance(s, (int, float)):
+                s_g = torch.full((self.groups,), float(s), dtype=torch.float32, device=v_g.device)
+            else:
+                s_g = s.to(dtype=torch.float32, device=v_g.device).view(-1)
+                if s_g.numel() == 1:
+                    s_g = torch.full((self.groups,), float(s_g.item()), dtype=torch.float32, device=v_g.device)
+                elif s_g.shape != (self.groups,):
+                    raise ValueError(f"speed_scale must be scalar or shape [{self.groups}], got {tuple(s_g.shape)}")
+            v_g = v_g * s_g
+        v_eff = v_g.view(1, 1, self.groups, 1).to(dtype=x.dtype, device=x.device)
 
         B, T, D = x.shape
         g, cg = self.groups, self.cg
@@ -189,8 +238,8 @@ class Advective1D(nn.Module):
                 m_right = torch.zeros_like(mb)
                 m_right[:, :-1, ...] = mb[:, 1:, ...]
 
-            if self.scheme == "central":
-                if self.bc == "cycle":
+            if scheme == "central":
+                if bc == "cycle":
                     right = torch.roll(xg, shifts=-1, dims=1)
                     left  = torch.roll(xg, shifts=+1, dims=1)
                     if m is None:
@@ -231,9 +280,8 @@ class Advective1D(nn.Module):
                         # forward at right border or where no left neighbor
                         diff[valid_fwd] = ((x_right - xg) / self.dx)[valid_fwd]
                         # else zero (pads or invalid)
-            elif self.scheme == "upwind":
-                v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)
-                if self.bc == "cycle":
+            elif scheme == "upwind":
+                if bc == "cycle":
                     back = xg - torch.roll(xg, shifts=+1, dims=1)     # backward diff
                     fwd  = torch.roll(xg, shifts=-1, dims=1) - xg     # forward diff
                 else:  # 'path'
@@ -248,20 +296,24 @@ class Advective1D(nn.Module):
                     valid_fwd = mb & m_right
                     back = torch.where(valid_back, back, torch.zeros_like(back))
                     fwd = torch.where(valid_fwd, fwd, torch.zeros_like(fwd))
+                v = v_eff
                 diff = torch.where(v >= 0, back, fwd) / self.dx
             else:
                 raise ValueError("scheme must be 'central' or 'upwind'.")
 
         # Multiply by group speeds (broadcast [1,1,G,1])
-        v = self.speed.view(1, 1, g, 1).to(dtype=x.dtype, device=x.device)
-        yg = v * diff
+        y_g = v_eff * diff
 
         # Restore to [B,T,D]
         if m is not None:
-            y = (yg.view(B, T, D)) * (m.squeeze(-1).squeeze(-1).to(yg.dtype))
+            y = (y_g.view(B, T, D)) * (m.squeeze(-1).squeeze(-1).to(y_g.dtype))
         else:
-            y = yg.view(B, T, D)
+            y = y_g.view(B, T, D)
         return y
+
+    def op(self, x: Tensor, *, ctx: dict | None = None, mask: Tensor | None = None) -> Tensor:
+        """Uniform operator interface: y = Op_i(x; ctx)."""
+        return self.forward(x, mask=mask, ctx=ctx)
 
 
 # ---------------------------------- __main__ ----------------------------------

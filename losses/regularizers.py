@@ -14,6 +14,37 @@ Tensor = torch.Tensor
 Array = Union[Tensor, float]
 
 
+# ------------------------------ similarity helpers ---------------------------
+
+def _pairwise_cosine_matrix(Ys: Sequence[Tensor], eps: float = 1e-8) -> Optional[Tensor]:
+    """
+    Build a pairwise cosine-similarity matrix over a list of feature tensors.
+    Each tensor Y has shape [*, D] or [B, T, D]; we flatten all leading dims to N×D, L2-normalize, and compute C = U U^T.
+    Returns [M, M] (M=len(Ys)), or None if len(Ys) < 2.
+    """
+    M = len(Ys)
+    if M < 2:
+        return None
+    U_list = []
+    for Y in Ys:
+        if Y is None:
+            continue
+        Y2 = Y
+        if Y2.dim() >= 2:
+            Y2 = Y2.reshape(-1, Y2.shape[-1])  # [N, D]
+        else:
+            Y2 = Y2.unsqueeze(0)
+        U = F.normalize(Y2.float(), p=2, dim=-1, eps=eps)  # [N, D]
+        # pooled mean direction for stability (avoid O(N^2) memory)
+        u_bar = U.mean(dim=0, keepdim=True)                 # [1, D]
+        U_list.append(u_bar)
+    if not U_list:
+        return None
+    Ustack = torch.cat(U_list, dim=0)   # [M, D]
+    C = (Ustack @ Ustack.t()).clamp(min=-1.0, max=1.0)  # [M, M]
+    return C
+
+
 # ------------------------------ param utilities ------------------------------
 
 def _iter_params(
@@ -255,6 +286,85 @@ def gate_bernoulli_kl(
     return coeff * kl.mean()
 
 
+def gate_l0_proxy(
+    g: Tensor,
+    *,
+    coeff: float = 1e-4,
+    from_logits: bool = False,
+    beta: float = 2.0,
+) -> Tensor:
+    """
+    L0-like surrogate for gates in [0,1] or for their logits.
+    If from_logits=True, we map logits `a` to expected activation via a smooth hard-concrete CDF proxy: p = sigmoid(a / beta).
+    Else, we assume `g` \in [0,1] and take E[L0] ≈ sum(g), which coincides with L1 on [0,1].
+    """
+    if coeff == 0.0:
+        return torch.zeros((), device=g.device, dtype=g.dtype)
+    if from_logits:
+        p = torch.sigmoid(g.float() / beta)
+        return coeff * p.sum()
+    else:
+        return coeff * g.float().clamp(0.0, 1.0).sum()
+
+
+# ------------------------------ operator-bank penalties ----------------------
+
+def opbank_cosine_decorrelation(
+    Ys: Sequence[Tensor],
+    *,
+    coeff: float = 1e-4,
+    eps: float = 1e-8,
+    exclude_diag: bool = True,
+) -> Tensor:
+    """
+    Penalize cosine similarity between a list of operator outputs.
+    Args:
+      Ys: list/seq of tensors (each [..., D]); e.g., outputs of different ops on the same input.
+      coeff: scale; set 0 to disable.
+      exclude_diag: if True, ignore self-similarities on the diagonal.
+    Returns: scalar penalty.
+    """
+    if coeff == 0.0 or len(Ys) <= 1:
+        return torch.zeros((), dtype=torch.float32)
+    C = _pairwise_cosine_matrix(Ys, eps=eps)
+    if C is None:
+        return torch.zeros((), dtype=torch.float32)
+    if exclude_diag:
+        M = C.shape[0]
+        mask = torch.ones_like(C, dtype=torch.bool)
+        mask.fill_(True)
+        mask.fill_diagonal_(False)
+        val = torch.abs(C[mask]).mean() if mask.any() else torch.zeros((), dtype=C.dtype, device=C.device)
+    else:
+        val = torch.abs(C).mean()
+    return coeff * val
+
+
+# ------------------------------ energy smoothing -----------------------------
+
+def energy_oscillation_penalty(
+    E: Tensor,
+    *,
+    coeff: float = 1e-5,
+    hinge: float = 0.0,
+) -> Tensor:
+    """
+    Tiny penalty to discourage upward energy jumps between consecutive steps.
+    Args:
+      E: tensor of energies per-step [S] or [B,S].
+      hinge: allowed increase margin; only increases above `hinge` are penalized.
+    Returns: coeff * sum( relu( (E[t+1]-E[t]) - hinge ) ).
+    """
+    if coeff == 0.0:
+        return torch.zeros((), dtype=torch.float32)
+    if E.dim() == 1:
+        dE = E[1:] - E[:-1]
+    else:
+        dE = E[..., 1:] - E[..., :-1]
+    inc = F.relu(dE - float(hinge))
+    return coeff * inc.sum()
+
+
 # ------------------------------ aggregator helper ----------------------------
 
 def sum_regularizers(terms: Dict[str, Optional[Tensor]]) -> Tuple[Tensor, Dict[str, float]]:
@@ -339,6 +449,25 @@ if __name__ == "__main__":
         "g_l1": g_l1,
         "g_kl": g_kl,
     })
+
+    # New regs
+    g_logits = torch.randn_like(x[..., :2])
+    l0_from_logits = gate_l0_proxy(g_logits, coeff=1e-4, from_logits=True)
+    l0_from_probs = gate_l0_proxy(torch.sigmoid(g_logits), coeff=1e-4, from_logits=False)
+
+    Y1, Y2, Y3 = torch.randn(8, 16), torch.randn(8, 16), torch.randn(8, 16)
+    decor = opbank_cosine_decorrelation([Y1, Y2, Y3], coeff=1e-4)
+
+    E = torch.tensor([1.0, 0.9, 0.93, 0.91])
+    eosc = energy_oscillation_penalty(E, coeff=1e-5, hinge=0.0)
+
+    total2, scal2 = sum_regularizers({
+        "l0_logits": l0_from_logits,
+        "l0_probs": l0_from_probs,
+        "decor": decor,
+        "eosc": eosc,
+    })
+    assert total2.item() >= 0.0
 
     print("  scalars:", {k: f"{v:.3e}" for k, v in scalars.items()})
     assert total.item() >= 0.0

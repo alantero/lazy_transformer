@@ -87,6 +87,40 @@ def _unwrap_logits(out):
     return out[0] if isinstance(out, (tuple, list)) else out
 
 
+# --- Diagnostic: probe causality (no-peek) ---
+@torch.no_grad()
+def _probe_no_peek_causality(model: nn.Module, V: int, pad_id: int, device: torch.device,
+                             trials: int = 6, T: int = 4, eps: float = 1e-5) -> Tuple[bool, float]:
+    """
+    Devuelve (ok, max_diff). ok=True ssi los logits en posiciones enmascaradas
+    no dependen de tokens futuros (invarianza bajo máscara).
+    Construimos pares de secuencias idénticas hasta t (incl.) y distintas después,
+    con máscara que oculta posiciones > t, y comparamos logits en t.
+    """
+    import random
+    model.eval()
+    maxdiff = 0.0
+    for _ in range(trials):
+        t = 1 if T <= 3 else random.randint(1, T-2)
+        prefix = torch.randint(low=0, high=max(2, V-1), size=(t+1,), device=device)
+        prefix = torch.where(prefix == pad_id, (prefix + 1) % V, prefix)
+        k = max(0, T - (t + 1))
+        futA = torch.randint(low=0, high=max(2, V-1), size=(k,), device=device)
+        futB = torch.randint(low=0, high=max(2, V-1), size=(k,), device=device)
+        futA = torch.where(futA == pad_id, (futA + 1) % V, futA)
+        futB = torch.where(futB == pad_id, (futB + 1) % V, futB)
+        seqA, seqB = torch.cat([prefix, futA]), torch.cat([prefix, futB])
+        tokens = torch.stack([seqA, seqB], dim=0).view(2, -1)  # [2,T]
+        mask = torch.ones_like(tokens, dtype=torch.bool, device=device)
+        if T > t + 1:
+            mask[:, t+1:] = False
+        logits = _unwrap_logits(model.forward_tokens(tokens, mask))  # [2,T,V]
+        la, lb = logits[0, t], logits[1, t]
+        diff = torch.max(torch.abs(la - lb)).item()
+        maxdiff = max(maxdiff, diff)
+    return (maxdiff <= eps, float(maxdiff))
+
+
 @torch.no_grad()
 def _last_logits(model: nn.Module, tokens: Tensor, mask: Optional[Tensor]) -> Tensor:
     """Return logits on the last valid position of each sequence: [B,V]."""
@@ -490,8 +524,8 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="sample", choices=["sample", "typical", "greedy"],
                         help="Decoding method (legacy alias, e.g., 'sample', 'greedy', 'typical'). Prefer --decode-method.")
     parser.add_argument("--integ-method", type=str, default=None,
-                        choices=["euler", "heun", "rk4", "etd-symplectic"],
-                        help="Override the model integrator method in cfg (e.g., 'heun').")
+                        choices=["euler", "heun", "rk4", "etd-symplectic", "ph-strang-nl"],
+                        help="Override the model integrator method in cfg: euler|heun|rk4|etd-symplectic|ph-strang-nl")
     parser.add_argument("--decode-method", type=str, default=None,
                         choices=["sample", "typical", "greedy"],
                         help="Decoding strategy. If omitted, falls back to --method.")
@@ -517,12 +551,22 @@ if __name__ == "__main__":
     parser.add_argument("--keep-collar-on-teleport", action="store_true", help="Keep last O tokens when teleporting.")
     parser.add_argument("--no-teleports", action="store_true", help="Disable all teleport logic.")
     parser.add_argument("--eos-id", type=int, default=None, help="Override EOS id (defaults to tokenizer.eos_token_id when --eos-stop).")
+    parser.add_argument("--tokenizer-dir", type=str, default="/eos/home-a/alantero/gpt2_tokenizer",
+                        help="Ruta a un directorio local con el tokenizador HF (por defecto: /eos/home-a/alantero/gpt2_tokenizer).")
     # Back-compat alias (typo) for head bias printing
     parser.add_argument("--print-head-bias-topk", type=int, default=0, help="If >0, print top-K tokens by output head bias (debug).")
+    # Diagnostic flags
+    parser.add_argument("--check-causality", action="store_true",
+                        help="Prueba no-peek: verifica que logits en posiciones enmascaradas no dependan del futuro.")
+    parser.add_argument("--dump-cfg", action="store_true",
+                        help="Imprime la cfg final resuelta (ckpt + overrides).")
+    parser.add_argument("--dump-token-debug", action="store_true",
+                        help="Imprime info extra del tokenizador/alineamiento.")
     args = parser.parse_args()
 
     # --- Determine effective decoding method ---
     dec_method = args.decode_method if getattr(args, "decode_method", None) else args.method
+    print(f"[decode] method={dec_method} | temperature={args.temperature} | top_k={args.top_k} | top_p={args.top_p} | typical_p={args.typical_p} | min_p={args.min_p}")
 
     # Back-compat: if the old typo flag was used, propagate to the new one
     if getattr(args, "print_head_biais_topk", 0) and not getattr(args, "print_head_bias_topk", 0):
@@ -553,6 +597,13 @@ if __name__ == "__main__":
         raise KeyError(f"Faltan claves en cfg: {_missing}")
 
     cfg_m = LoopConfig(**cfg_dict)
+    if getattr(args, "dump_cfg", False):
+        try:
+            import pprint
+            print("[cfg.dump] resolved model config:")
+            pprint.pprint({k: getattr(cfg_m, k) for k in cfg_m.__annotations__.keys() if hasattr(cfg_m, k)})
+        except Exception as _e:
+            print(f"[cfg.dump] failed: {_e}")
     # Sanity guard: requerimos Laplaciano causal para evitar fuga al futuro.
     cheb_kind = str(getattr(cfg_m, "cheb_laplacian", ""))
     if cheb_kind != "path_causal":
@@ -575,6 +626,67 @@ if __name__ == "__main__":
             print(f"[load] missing keys: {len(missing)} e.g. {missing[:5]}")
         if unexpected:
             print(f"[load] unexpected keys: {len(unexpected)} e.g. {unexpected[:5]}")
+
+    # --- Auto-patch for mis-shaped head.weight_mul --------------------------------
+    # Algunos checkpoints guardaron head.weight_mul con tamaño d_model, pero el forward
+    # lo aplica *después* del proyector a logits [B,T,V]. Si la forma no es compatible
+    # con [V, D], lo sustituimos por una matriz de ceros (no-op) del tamaño [V, D].
+    # Hacer esto ANTES de cualquier forward.
+    try:
+        V_expected = int(getattr(cfg_m, "vocab_size"))
+        head_mod = getattr(model, "head", None)
+
+        def _as_tensor(x):
+            if isinstance(x, torch.nn.Parameter):
+                return x.data
+            return x
+
+        def _shape_is_ok_2d(x, V: int, D: int) -> bool:
+            if x is None:
+                return False
+            t = _as_tensor(x)
+            if not torch.is_tensor(t):
+                return False
+            return (t.ndim == 2) and (t.shape[0] == V) and (t.shape[1] == D)
+
+        if head_mod is not None and hasattr(head_mod, "weight_mul"):
+            wm = getattr(head_mod, "weight_mul")
+            # Infer D from the head projection weight (assumed [V, D])
+            try:
+                W_head = getattr(head_mod, "weight")
+                if W_head is None:
+                    raise AttributeError("head.weight is None")
+                D_expected = int(W_head.shape[1])
+            except Exception:
+                # Fallback to cfg.d_model if head.weight not present
+                D_expected = int(getattr(cfg_m, "d_model"))
+
+            if not _shape_is_ok_2d(wm, V_expected, D_expected):
+                # We want a SAFE no-op: a zero matrix [V, D] so that:
+                # logits_mul = inter @ weight_mul.t() adds nothing.
+                try:
+                    dev = W_head.device if "W_head" in locals() else next(model.parameters()).device
+                except Exception:
+                    dev = torch.device(getattr(cfg_m, "device", "cpu"))
+                try:
+                    dtype = W_head.dtype if "W_head" in locals() else next(model.parameters()).dtype
+                except Exception:
+                    dtype = torch.float32
+
+                with torch.no_grad():
+                    new_wm = torch.nn.Parameter(torch.zeros((V_expected, D_expected), device=dev, dtype=dtype))
+                setattr(model.head, "weight_mul", new_wm)
+
+                old_shape = None
+                try:
+                    t = _as_tensor(wm)
+                    old_shape = tuple(t.shape) if hasattr(t, "shape") else type(wm)
+                except Exception:
+                    old_shape = type(wm)
+                print(f"[patch] head.weight_mul {old_shape} → zeros[{V_expected},{D_expected}] (no-op) para inference.")
+    except Exception as e:
+        print(f"[warn] auto-patch de head.weight_mul falló: {e}")
+    # -------------------------------------------------------------------------------
 
     # --- Inspect/zero output head bias (optional; only if flags request it) ---
     if (getattr(args, "zero_head_bias", False) or (getattr(args, "print_head_bias_topk", 0) and int(args.print_head_bias_topk) > 0)):
@@ -663,7 +775,12 @@ if __name__ == "__main__":
 
 
     # --- Tokenizer: load GPT-2 and align with checkpoint cfg (pad/vocab) ---
-    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    tok_dir = getattr(args, "tokenizer_dir", "/eos/home-a/alantero/gpt2_tokenizer")
+    try:
+        tok = GPT2TokenizerFast.from_pretrained(tok_dir, local_files_only=True)
+    except Exception as e:
+        print(f"[warn] tokenizer local load failed from '{tok_dir}' ({e}); falling back to 'gpt2' via HF cache")
+        tok = GPT2TokenizerFast.from_pretrained("gpt2")
     # Default: if no pad set, use EOS as pad for safety
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -675,6 +792,18 @@ if __name__ == "__main__":
             tok.pad_token = "<|pad|>"
     except Exception as e:
         print(f"[warn] tokenizer alignment: {e}")
+    if getattr(args, "dump_token_debug", False):
+        try:
+            suspects = [11, 0, int(tok.eos_token_id), int(tok.pad_token_id)]
+            names = [",", "!(id 0)", "<|eos|>", "<|pad|>"]
+            print("[tok.dump] basic ids:")
+            for s, name in zip(suspects, names):
+                if 0 <= int(s) < int(len(tok)):
+                    dec = tok.decode([int(s)], skip_special_tokens=False)
+                    print(f"  id {int(s):>6} → '{dec}'   ({name})")
+            print(f"[tok.dump] cfg.vocab_size={int(cfg_m.vocab_size)} | tok.vocab_size={int(len(tok))} | cfg.pad_id={int(cfg_m.pad_id)} | tok.pad_id={int(tok.pad_token_id)} | tok.eos_id={int(tok.eos_token_id)}")
+        except Exception as _e:
+            print(f"[tok.dump] failed: {_e}")
 
     enc = tok(args.prompt, return_tensors="pt", add_special_tokens=False)
     tokens = enc["input_ids"].to(device)
@@ -688,11 +817,28 @@ if __name__ == "__main__":
     with torch.no_grad():
         t_short = tokens[:, -min(tokens.size(1), cfg_m.W):]
         m_short = None if mask is None else mask[:, -t_short.size(1):]
-        head_test = _unwrap_logits(model.forward_tokens(t_short, m_short))
+        try:
+            head_test = _unwrap_logits(model.forward_tokens(t_short, m_short))
+        except RuntimeError as e:
+            msg = str(e)
+            if "must match the size of tensor" in msg and hasattr(model, "head") and hasattr(model.head, "weight_mul"):
+                # Forzar escalar 1.0 y reintentar una vez
+                dev = t_short.device
+                model.head.weight_mul = torch.nn.Parameter(torch.ones((), device=dev))
+                print("[patch] retry forward con head.weight_mul=1.0 (escalar) por mismatch de forma.")
+                head_test = _unwrap_logits(model.forward_tokens(t_short, m_short))
+            else:
+                raise
     V = int(head_test.size(-1))
     if V != int(cfg_m.vocab_size):
         raise SystemExit(f"[error] head dim V={V} != cfg.vocab_size={int(cfg_m.vocab_size)}. "
                          f"Check tokenizer/ckpt/config alignment.")
+    if getattr(args, "check_causality", False):
+        ok, maxdiff = _probe_no_peek_causality(model,
+                                               V=int(cfg_m.vocab_size),
+                                               pad_id=int(cfg_m.pad_id),
+                                               device=device, trials=8, T=min(6, int(cfg_m.W)))
+        print(f"[probe] causality(no-peek)={'OK' if ok else 'FAIL'} | max|Δlogits|={maxdiff:.3e} en posiciones enmascaradas")
 
     if getattr(args, "debug_topk", False):
         try:
@@ -735,73 +881,8 @@ if __name__ == "__main__":
     text = tok.decode(full_out[0].tolist(), skip_special_tokens=True)
     print("\n=== Streamed Output ===\n" + text)
     print(f"[stats] teleports={out['teleports']} stopped_optimum={out['stopped_optimum']}")
+    print("[tok] eos=", tok.eos_token_id, "pad=", tok.pad_token_id, "vocab=", len(tok))
+    print("[cfg] vocab_size=", cfg_m.vocab_size, "pad_id=", cfg_m.pad_id, "method=", cfg_m.method)
+    if getattr(args, "dump_token_debug", False):
+        print(f"[align] V(head)={V} == cfg.vocab_size={int(cfg_m.vocab_size)} == len(tok)={int(len(tok))}? → {V == int(cfg_m.vocab_size) == int(len(tok))}")
 
-"""
-if __name__ == "__main__":
-    # Minimal sanity: run with an untrained ContinuousLM (distribution is random but pipeline works).
-    torch.manual_seed(0)
-    print("[streamer] Running sanity test...")
-
-    # Safe import of the model + tiny tokenizer for a demo
-    # Ensure repo root is on sys.path when running as a script
-    if __package__ in (None, ""):
-        import os, sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-    try:
-        from train.loop import ContinuousLM, LoopConfig
-    except Exception as e:
-        raise SystemExit(f"Cannot import model (train/loop.py). Error: {e}")
-
-    try:
-        from data.tok_embed import SimpleVocab, pack_batch  # preferred
-    except Exception:
-        from data.tokenize import SimpleVocab, pack_batch   # fallback
-
-    # Tiny vocab / prompt
-    texts = ["hello there", "general kenobi", "hello hello"]
-    vocab = SimpleVocab.build_from_texts(texts, mode="char", add_unk=False)
-    enc = lambda s: vocab.encode(s, mode="char", add_bos=True, add_eos=False)
-
-    prompts = ["hello "]
-    seqs = [enc(s) for s in prompts]
-    tokens, mask = pack_batch(seqs, pad_id=vocab.pad_id)  # [B,T]
-    B, T = tokens.shape
-
-    # Model config (toy)
-    cfg_m = LoopConfig(
-        W=32, O=8,
-        vocab_size=vocab.size, d_model=64, groups=8,
-        cheb_deg=4, cheb_laplacian="cycle",
-        skew_rank=8, R_rank=4,
-        steps=2, dt=0.5, method="heun",
-        tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
-        pad_id=vocab.pad_id,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        use_gauge=True,
-    )
-    device = torch.device(cfg_m.device)
-    model = ContinuousLM(cfg_m).to(device).eval()
-
-    tokens = tokens.to(device)
-    mask = mask.to(device)
-
-    # Streamer config
-    cfg_s = StreamerConfig(
-        W=cfg_m.W, O=cfg_m.O,
-        temperature=1.0, top_k=0, top_p=1.0,
-        stop_on_optimum=True, opt_window=6, opt_patience=3, opt_eps=5e-4, min_new_tokens=2,
-        teleport_every=10, teleport_on_low_capacity=True, cap_threshold=0.10, keep_collar_on_teleport=True,
-        device=str(device), pad_id=vocab.pad_id, eos_id=vocab.eos_id,
-    )
-
-    streamer = Streamer(model, cfg_s)
-
-    out = streamer.generate(tokens, mask, max_new_tokens=24)
-    gen = out["generated"].cpu()
-    for i in range(gen.shape[0]):
-        decoded = vocab.decode(gen[i].tolist(), mode="char")
-        print(f"  sample[{i}] → '{decoded}' | teleports={out['teleports']} | stop_opt={out['stopped_optimum']}")
-
-    print("[streamer] Done ✓")
-"""

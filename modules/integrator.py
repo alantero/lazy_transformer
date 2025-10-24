@@ -10,6 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from operators.p_laplace import edge_weights as _nl_edge_weights, apply_anisotropic_laplacian as _nl_apply
+    _HAS_NL_DIFF = True
+except Exception:
+    _HAS_NL_DIFF = False
+
 
 Tensor = torch.Tensor
 Field = Union[nn.Module, Callable[..., Tensor]]  # avoid PEP604 for Py<3.10
@@ -39,7 +45,7 @@ class Integrator(nn.Module):
         field: nn.Module or callable computing f(h, **field_kwargs) -> Tensor[B,T,D].
                (For 'etd-symplectic', the field can (optionally) expose:
                 _apply_G(y), _apply_R(y), _apply_J(y), and attributes R_scale, use_diag_R, rho, B, R_rank.)
-        method: 'euler' | 'heun' | 'rk4' | 'etd-symplectic'  (default 'heun' per v3).
+        method: 'euler' | 'heun' | 'rk4' | 'etd-symplectic' | 'ph-strang-nl'  (default 'heun' per v3).
         dt: default step size.
         steps: default number of steps.
         limit_rms: if set, scales each step so ||dt·k||_rms ≤ limit_rms (basic stability guard).
@@ -62,8 +68,8 @@ class Integrator(nn.Module):
             raise TypeError("field must be callable or an nn.Module with __call__.")
         self.field = field
         self.method = method.lower()
-        if self.method not in {"euler", "heun", "rk4", "etd-symplectic"}:
-            raise ValueError("method must be one of: 'euler', 'heun', 'rk4', 'etd-symplectic'.")
+        if self.method not in {"euler", "heun", "rk4", "etd-symplectic", "ph-strang-nl"}:
+            raise ValueError("method must be one of: 'euler', 'heun', 'rk4', 'etd-symplectic', 'ph-strang-nl'.")
         self.dt = float(dt)
         self.steps = int(steps)
         self.limit_rms = float(limit_rms) if limit_rms is not None else None
@@ -89,7 +95,7 @@ class Integrator(nn.Module):
             raise ValueError(f"field returned shape {tuple(out.shape)}, expected {tuple(h.shape)}.")
         return out
 
-    def _call_hook(self, hook, s_idx: int, name: str, x: Tensor, x_next: Tensor, dt_eff: float, k_rms: Optional[float] = None) -> None:
+    def _call_hook(self, hook, s_idx: int, name: str, x: Tensor, x_next: Tensor, dt_eff: float, k_rms: Optional[float] = None, extra: Optional[Dict[str, float]] = None) -> None:
         """Safely invoke optional per-step hook for logging/diagnostics.
         Never raises; computes simple RMS-based stats.
         """
@@ -110,6 +116,10 @@ class Integrator(nn.Module):
                     "k_rms": float(k_rms) if k_rms is not None else float(k_est_rms),
                     "k_est_rms": float(k_est_rms),
                 }
+                if extra:
+                    for k, v in extra.items():
+                        if isinstance(v, (int, float)):
+                            payload[k] = float(v)
                 hook(payload)
         except Exception:
             # Do not let diagnostics break the training/inference loop
@@ -121,7 +131,7 @@ class Integrator(nn.Module):
         k1 = self._f(h, **kw)
         dt1, k1_r = self._guard_dt(k1, dt)
         out = h + dt1 * k1
-        self._call_hook(hook, s_idx, "euler", h, out, dt1, k1_r)
+        self._call_hook(hook, s_idx, "euler", h, out, dt1, k1_r, extra=None)
         return out
 
     def _step_heun(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
@@ -132,7 +142,7 @@ class Integrator(nn.Module):
         k_avg = 0.5 * (k1 + k2)
         dt2, k_avg_r = self._guard_dt(k_avg, dt)
         out = h + dt2 * k_avg
-        self._call_hook(hook, s_idx, "heun", h, out, dt2, k_avg_r)
+        self._call_hook(hook, s_idx, "heun", h, out, dt2, k_avg_r, extra=None)
         return out
 
     def _step_rk4(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
@@ -143,7 +153,7 @@ class Integrator(nn.Module):
         k4 = self._f(h + dt_eff * k3, **kw)
         out = h + (dt_eff / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         # Use k1 RMS as a proxy for logging
-        self._call_hook(hook, s_idx, "rk4", h, out, dt_eff, k1_r)
+        self._call_hook(hook, s_idx, "rk4", h, out, dt_eff, k1_r, extra=None)
         return out
 
     # ------------------------- ETD–symplectic step ----------------------------
@@ -163,7 +173,7 @@ class Integrator(nn.Module):
             return self._step_heun(h, dt, s_idx, hook, **kw)
 
         B, T, D = h.shape
-        y = h.view(B * T, D)  # flatten for last-dim linear ops
+        y = h.reshape(B * T, D)  # flatten for last-dim linear ops
 
         # Resolve dissipative scale in a way that is compatible with PortHamiltonianStep
         if hasattr(f, "_R_scale") and callable(getattr(f, "_R_scale")):
@@ -186,7 +196,12 @@ class Integrator(nn.Module):
         if getattr(f, "use_diag_R", False) and hasattr(f, "rho"):
             diag = F.softplus(getattr(f, "rho"))  # [D]
             if torch.is_tensor(diag) and diag.dim() == 1 and diag.numel() == D:
-                decay = torch.exp(-dt * R_scale * (diag + getattr(f, "eps", 0.0)))
+                _eps = getattr(f, "eps", 0.0)
+                if torch.is_tensor(_eps):
+                    _eps = _eps.to(y).detach()
+                else:
+                    _eps = torch.tensor(float(_eps), device=y.device, dtype=y.dtype)
+                decay = torch.exp(-dt * R_scale * (diag + _eps))
                 y = y * decay  # exact ETD for diag
                 used_exact_diag = True
 
@@ -205,8 +220,117 @@ class Integrator(nn.Module):
         Jy_mid = f._apply_J(y_mid)
         y = y + dt * Jy_mid
 
-        out = y.view(B, T, D)
-        self._call_hook(hook, s_idx, "etd-symplectic", h, out, dt, None)
+        out = y.reshape(B, T, D)
+        self._call_hook(hook, s_idx, "etd-symplectic", h, out, dt, None, extra=None)
+        return out
+
+    # ------------------------- PH-Strang-NL step ------------------------------
+    # Strang-like splitting with nonlinear diffusion (p-Laplacian / TV-Huber)
+    def _step_ph_strang_nl(self, h: Tensor, dt: float, s_idx: int, hook=None, **kw) -> Tensor:
+        f = self.field
+        # Check duck-typed hooks and nonlinear diffusion availability
+        hasG = _has_attr(f, "_apply_G")
+        hasR = _has_attr(f, "_apply_R")
+        hasJ = _has_attr(f, "_apply_J")
+        if not (hasG and hasR and hasJ and _HAS_NL_DIFF):
+            # Fallback
+            return self._step_heun(h, dt, s_idx, hook, **kw)
+
+        B, T, D = h.shape
+        nl = kw.get("nl_diffusion", {})
+        groups = int(kw.get("groups", 1))
+
+        # --- new: compute E_pre (simple energy) ---
+        E_pre = float((h * h).mean().item())
+
+        enabled = bool(nl.get("enabled", True))
+        p = float(nl.get("p", 1.5))
+        delta = float(nl.get("huber_delta", 1e-3))
+        a_min = float(nl.get("a_min", 0.2))
+        a_max = float(nl.get("a_max", 5.0))
+        recompute = int(nl.get("recompute_iters", 1))
+        reduce = str(nl.get("reduce", "group"))
+        nl_causal = bool(nl.get("causal", True))
+
+        # (1) Half-wave skew (J) on G-space with half step dt/2
+        y = h.reshape(B * T, D)
+        y = f._apply_G(y)
+        Jy = f._apply_J(y)
+        y_mid = y + 0.5 * (dt/2) * Jy
+        Jy_mid = f._apply_J(y_mid)
+        y = y + (dt/2) * Jy_mid
+        h1 = y.reshape(B, T, D)
+
+        # (2) Nonlinear diffusion
+        A_mean = A_min = A_max = None
+        if enabled and _HAS_NL_DIFF:
+            for _ in range(recompute):
+                A = _nl_edge_weights(h1, groups=groups, p=p, huber_delta=delta, a_min=a_min, a_max=a_max, reduce=reduce, causal=nl_causal)
+                # stats
+                A_mean = float(A.mean().item())
+                A_min = float(A.min().item())
+                A_max = float(A.max().item())
+                h1 = h1 + dt * _nl_apply(h1, A, groups=groups, reduce=reduce, causal=nl_causal)
+
+        # (3) Dissipative ETD (R) on G-space
+        y = h1.reshape(B * T, D)
+        y = f._apply_G(y)
+
+        # Resolve dissipative scale
+        if hasattr(f, "_R_scale") and callable(getattr(f, "_R_scale")):
+            _rs = f._R_scale()
+            if torch.is_tensor(_rs):
+                R_scale = float(_rs.detach().float().item())
+            else:
+                R_scale = float(_rs)
+        elif hasattr(f, "R_scale"):
+            _rs = getattr(f, "R_scale")
+            R_scale = float(_rs.detach().float().item()) if torch.is_tensor(_rs) else float(_rs)
+        else:
+            R_scale = 1.0
+
+        used_exact_diag = False
+        if getattr(f, "use_diag_R", False) and hasattr(f, "rho"):
+            diag = F.softplus(getattr(f, "rho"))  # [D]
+            if torch.is_tensor(diag) and diag.dim() == 1 and diag.numel() == D:
+                _eps = getattr(f, "eps", 0.0)
+                if torch.is_tensor(_eps):
+                    _eps = _eps.to(y).detach()
+                else:
+                    _eps = torch.tensor(float(_eps), device=y.device, dtype=y.dtype)
+                decay = torch.exp(-dt * R_scale * (diag + _eps))
+                y = y * decay  # exact ETD for diag
+                used_exact_diag = True
+
+        if used_exact_diag and hasattr(f, "R_rank") and getattr(f, "R_rank") and hasattr(f, "B") and getattr(f, "B") is not None:
+            y = y - dt * R_scale * ((y @ f.B) @ f.B.t())
+        elif not used_exact_diag:
+            y = y - dt * f._apply_R(y)
+
+        h2 = y.reshape(B, T, D)
+
+        # (4) Half-wave skew (J) again on G-space starting from h2
+        y = h2.reshape(B * T, D)
+        y = f._apply_G(y)
+        Jy = f._apply_J(y)
+        y_mid = y + 0.5 * (dt/2) * Jy
+        Jy_mid = f._apply_J(y_mid)
+        y = y + (dt/2) * Jy_mid
+
+        out = y.reshape(B, T, D)
+        # --- new: compute E_post ---
+        E_post = float((out * out).mean().item())
+        # Build extras
+        extra = {}
+        if A_mean is not None:
+            extra["A_mean"] = A_mean
+        if A_min is not None:
+            extra["A_min"] = A_min
+        if A_max is not None:
+            extra["A_max"] = A_max
+        extra["E_pre"] = E_pre
+        extra["E_post"] = E_post
+        self._call_hook(hook, s_idx, "ph-strang-nl", h, out, dt, None, extra=extra)
         return out
 
     # -------------------------------- forward ---------------------------------
@@ -221,7 +345,7 @@ class Integrator(nn.Module):
         should_step: Optional[Callable[[Tensor, Tensor, int], bool]] = None,
         step_hook: Optional[Callable[[Dict[str, float]], None]] = None,
         **field_kwargs,
-    ) -> Tensor | Tuple[Tensor, List[Tensor]]:
+    ) -> Union[Tensor, Tuple[Tensor, List[Tensor]]]:
         """
         Integrate h forward by `steps` using `method` and step size `dt`.
 
@@ -244,14 +368,82 @@ class Integrator(nn.Module):
             "heun": self._step_heun,
             "rk4": self._step_rk4,
             "etd-symplectic": self._step_etd_symplectic,
+            "ph-strang-nl": self._step_ph_strang_nl,
         }[self.method]
+
+        # Strip integrator-only extras from the kwargs passed to the field
+        _blocked_keys = {"norm", "norm_kwargs", "gauge", "gate", "gauge_kwargs", "gate_kwargs"}
+        field_kw = {k: v for k, v in field_kwargs.items() if k not in _blocked_keys}
+        gauge_mod = field_kwargs.get("gauge", None)
+        gate_mod = field_kwargs.get("gate", None)
+        gauge_kw = field_kwargs.get("gauge_kwargs", {}) or {}
+        gate_kw = field_kwargs.get("gate_kwargs", {}) or {}
+        norm_mod = field_kwargs.get("norm", None)
+        norm_kw = field_kwargs.get("norm_kwargs", {}) or {}
 
         x = h
         if keep_path:
             path = [x.detach().clone()]
 
         for s in range(S):
-            x_next = step_fn(x, dT, s, step_hook, **field_kwargs)
+            # Optional pre-ops: pre-norm, gauge (multiplicative scale), and gate (sparse mixture)
+            x_in = x
+            # Optional pre-norm
+            if norm_mod is not None:
+                try:
+                    x_in = norm_mod(x_in, **norm_kw)
+                except Exception:
+                    # If normalization fails, continue without it
+                    x_in = x_in
+            if gauge_mod is not None:
+                try:
+                    x_in = gauge_mod(x_in, **gauge_kw)
+                except Exception:
+                    # Keep training robust even if gauge fails; fall back to identity
+                    x_in = x
+
+            # ---- Gate stats extras ----
+            extras_pre: Dict[str, float] = {}
+            if gate_mod is not None:
+                try:
+                    y_gate = gate_mod(x_in, **gate_kw)
+                    # Assign x_in as usual
+                    x_in = y_gate[0] if isinstance(y_gate, (tuple, list)) else y_gate
+                    # Stats extraction
+                    if isinstance(y_gate, (tuple, list)) and len(y_gate) > 1:
+                        w = y_gate[1]
+                        if torch.is_tensor(w):
+                            # Normalize along last dim
+                            p = w / (w.sum(dim=-1, keepdim=True) + 1e-9)
+                            gate_ent = float((-(p * (p + 1e-9).log()).sum(dim=-1)).mean().item())
+                            gate_active = float((w > 0.5).float().sum(dim=-1).float().mean().item())
+                            extras_pre["gate_ent"] = gate_ent
+                            extras_pre["gate_active"] = gate_active
+                        elif isinstance(w, dict):
+                            for k, v in w.items():
+                                if isinstance(v, (int, float)):
+                                    extras_pre[k] = float(v)
+                    elif isinstance(y_gate, dict):
+                        # Accept dict with numeric values
+                        for k, v in y_gate.items():
+                            if isinstance(v, (int, float)):
+                                extras_pre[k] = float(v)
+                except Exception:
+                    x_in = x_in
+
+            # ---- Step hook wrapping for extras_pre ----
+            hook_to_use = step_hook
+            if extras_pre and step_hook is not None:
+                def _wrapped_hook(payload: Dict[str, float]):
+                    try:
+                        for k, v in extras_pre.items():
+                            payload.setdefault(k, float(v))
+                        step_hook(payload)
+                    except Exception:
+                        step_hook(payload)
+                hook_to_use = _wrapped_hook
+
+            x_next = step_fn(x_in, dT, s, hook_to_use, **field_kw)
             if self.detach_between_steps:
                 x_next = x_next.detach()
 
@@ -356,6 +548,15 @@ if __name__ == "__main__":
         hT_g = Integrator(step, method="heun", dt=0.5, steps=10)(h0, should_step=small_change_gate)
         # No assertion; just ensure it runs
         print("[integrator] Gate demo ran ✓")
+
+        # ph-strang-nl test if available
+        try:
+            if _HAS_NL_DIFF:
+                integ_nl = Integrator(step, method="ph-strang-nl", dt=0.25, steps=2)
+                hT_nl = integ_nl(h0, nl_diffusion={"enabled": True, "p": 1.5, "huber_delta": 1e-3, "a_min": 0.2, "a_max": 5.0, "recompute_iters": 1, "reduce": "group", "causal": True}, groups=4)
+                print("[integrator] ph-strang-nl ran ✓")
+        except Exception as e:
+            print(f"[integrator] ph-strang-nl test skipped: {e}")
 
     except Exception as e:
         print(f"[integrator] PortHamiltonianStep test skipped: {e}")

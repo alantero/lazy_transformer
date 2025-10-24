@@ -44,13 +44,8 @@ from contextlib import nullcontext
 from tqdm.auto import tqdm
 
 # --- Project imports (robust fallbacks where possible) ------------------------
-try:
-    from configs.presets import get_preset, list_presets  # type: ignore
-except Exception:
-    def get_preset(name: str) -> Dict[str, Any]:
-        raise RuntimeError("configs.presets.get_preset not found. Create configs/presets.py.")
-    def list_presets() -> List[str]:
-        return []
+# Presets unused by default; config is read from JSON
+_HAVE_PRESETS = False
 
 try:
     from data.tok_embed import TokenEmbedder, SimpleVocab, pack_batch  # type: ignore
@@ -449,8 +444,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train Lazy Transformer LM (windowed).")
     # Data
     p.add_argument("--text-file", type=str, default=None, help="Path to a text file (one sample per line). If omitted, toy data is used.")
-    # Preset
-    p.add_argument("--preset", type=str, default=None, help=f"Preset name from configs.presets. Known: {', '.join(list_presets()) or 'none'}")
     # Steps / logging
     p.add_argument("--steps", type=int, default=None, help="Training steps (overwrites cfg if set).")
     p.add_argument("--log-interval", type=int, default=10, help="Steps between logs.")
@@ -461,7 +454,75 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--groups", type=int, default=None)
     p.add_argument("--cheb-deg", dest="cheb_deg", type=int, default=None)
     p.add_argument("--dt", type=float, default=None, help="Integrator time step (dt) for the dynamics/integrator.")
-    p.add_argument("--integ-method", dest="method", type=str, default=None, choices=["euler", "heun"], help="Integrator method to use (euler or heun).")
+    p.add_argument("--integ-method", dest="method", type=str, default=None,
+                  choices=["euler", "heun", "rk4", "etd-symplectic", "ph-strang-nl"],
+                  help="Integrator method: euler|heun|rk4|etd-symplectic|ph-strang-nl")
+
+    # Gate / Operator bank
+    p.add_argument("--use-gate", dest="use_gate", action="store_true")
+    p.add_argument("--no-use-gate", dest="use_gate", action="store_false")
+    p.set_defaults(use_gate=None)
+    p.add_argument("--gate-topk", dest="gate_topk", type=int, default=None)
+    p.add_argument("--gate-per-channel", dest="gate_per_channel", action="store_true")
+    p.add_argument("--no-gate-per-channel", dest="gate_per_channel", action="store_false")
+    p.set_defaults(gate_per_channel=None)
+    p.add_argument("--gate-gamma", dest="gate_gamma", type=float, default=None)
+
+    p.add_argument("--use-op-bank", dest="use_op_bank", action="store_true")
+    p.add_argument("--no-use-op-bank", dest="use_op_bank", action="store_false")
+    p.set_defaults(use_op_bank=None)
+    p.add_argument("--gate-topk-real", dest="gate_topk_real", type=int, default=None,
+                   help="Hard top-k for operator-bank selection (K).")
+
+    # Nonlinear diffusion (p-Laplacian / TV-Huber)
+    p.add_argument("--nl-diffusion-enabled", dest="nl_diffusion_enabled", action="store_true")
+    p.add_argument("--no-nl-diffusion-enabled", dest="nl_diffusion_enabled", action="store_false")
+    p.set_defaults(nl_diffusion_enabled=None)
+    p.add_argument("--nl-p", dest="nl_p", type=float, default=None)
+    p.add_argument("--nl-huber-delta", dest="nl_huber_delta", type=float, default=None)
+    p.add_argument("--nl-a-min", dest="nl_a_min", type=float, default=None)
+    p.add_argument("--nl-a-max", dest="nl_a_max", type=float, default=None)
+    p.add_argument("--nl-recompute-iters", dest="nl_recompute_iters", type=int, default=None)
+    p.add_argument("--nl-reduce", dest="nl_reduce", type=str, choices=["group", "channel"], default=None)
+
+    # Port-Hamiltonian nonlinear core (optional)
+    p.add_argument("--ph-nl-enabled", dest="ph_nl_enabled", action="store_true")
+    p.add_argument("--no-ph-nl-enabled", dest="ph_nl_enabled", action="store_false")
+    p.set_defaults(ph_nl_enabled=None)
+    p.add_argument("--ph-use-nl-R", dest="ph_use_nl_R", action="store_true")
+    p.add_argument("--no-ph-use-nl-R", dest="ph_use_nl_R", action="store_false")
+    p.set_defaults(ph_use_nl_R=None)
+    p.add_argument("--ph-use-nl-H", dest="ph_use_nl_H", action="store_true")
+    p.add_argument("--no-ph-use-nl-H", dest="ph_use_nl_H", action="store_false")
+    p.set_defaults(ph_use_nl_H=None)
+    p.add_argument("--ph-nl-rank", dest="ph_nl_rank", type=int, default=None)
+
+    # Output head multiplicative branch
+    p.add_argument("--head-use-mul", dest="head_use_mul", action="store_true")
+    p.add_argument("--no-head-use-mul", dest="head_use_mul", action="store_false")
+    p.set_defaults(head_use_mul=None)
+    p.add_argument("--head-mul-rank", dest="head_mul_rank", type=int, default=None)
+    p.add_argument("--head-mul-gate-init", dest="head_mul_gate_init", type=float, default=None)
+
+    # Extra debug logging toggles (integrator hook)
+    p.add_argument("--debug-log-A", dest="debug_log_A", action="store_true")
+    p.add_argument("--no-debug-log-A", dest="debug_log_A", action="store_false")
+    p.set_defaults(debug_log_A=None)
+    p.add_argument("--debug-log-gate", dest="debug_log_gate", action="store_true")
+    p.add_argument("--no-debug-log-gate", dest="debug_log_gate", action="store_false")
+    p.set_defaults(debug_log_gate=None)
+    p.add_argument("--debug-energy", dest="debug_energy", action="store_true")
+    p.add_argument("--no-debug-energy", dest="debug_energy", action="store_false")
+    p.set_defaults(debug_energy=None)
+
+    # Regularizers
+    p.add_argument("--reg-gate-l0", dest="reg_gate_l0", type=float, default=None)
+    p.add_argument("--reg-gate-from-logits", dest="reg_gate_from_logits", action="store_true")
+    p.add_argument("--no-reg-gate-from-logits", dest="reg_gate_from_logits", action="store_false")
+    p.set_defaults(reg_gate_from_logits=None)
+    p.add_argument("--reg-op-decor", dest="reg_op_decor", type=float, default=None)
+    p.add_argument("--reg-energy-osc", dest="reg_energy_osc", type=float, default=None)
+    p.add_argument("--reg-energy-hinge", dest="reg_energy_hinge", type=float, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=None)
     p.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
@@ -634,34 +695,70 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     set_seed(int(args.seed))
 
-    # --- Build cfg from preset or defaults -----------------------------------
-    if args.preset is not None:
-        preset_cfg = get_preset(args.preset)  # dict or LoopConfig-like dict
-        if isinstance(preset_cfg, LoopConfig):
-            preset_dict = asdict(preset_cfg)
-        else:
-            preset_dict = dict(preset_cfg)
+    # --- Build base cfg (prefer JSON config; ignore presets) ------------------
+    def _load_hf_like_config(path: str) -> Dict[str, Any]:
+        d = {}
+        if load_hf_config is not None:
+            try:
+                cfg_hf = load_hf_config(path)
+                d = asdict(cfg_hf)
+                logging.info(f"[hf] loaded HF config via utils.hf_config from {path}")
+                return d
+            except Exception as e:
+                logging.warning(f"[hf] hf_config loader failed for {path}: {e}")
+        cfg_path = path
+        if os.path.isdir(cfg_path):
+            cfg_path = os.path.join(cfg_path, "config.json")
+        try:
+            with open(cfg_path, "r") as f:
+                d = json.load(f)
+            logging.info(f"[hf] loaded plain JSON config from {cfg_path}")
+        except Exception as e:
+            logging.warning(f"[hf] failed to load plain JSON config from {cfg_path}: {e}")
+        return d
+
+    def _save_hf_like_config(d: Dict[str, Any], path: str) -> str:
+        """Save dict `d` as a plain JSON config. If `path` is a directory, write into path/config.json."""
+        out_path = path
+        if os.path.isdir(out_path):
+            out_path = os.path.join(out_path, "config.json")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(d, f, indent=2, sort_keys=True)
+        return out_path
+
+    # Resolve source config: CLI --hf-config wins; else default configs/config.json
+    base_dict: Dict[str, Any] = {}
+    user_hf_path = args.hf_config
+    default_hf_path = os.path.join("configs", "config.json")
+    cfg_source_path = None
+    if user_hf_path is not None:
+        cfg_source_path = user_hf_path
+        base_dict = _load_hf_like_config(user_hf_path)
     else:
-        # Reasonable small default (close to train/loop demo)
-        preset_dict = asdict(LoopConfig(
-            W=16, O=4,
-            vocab_size=128, d_model=64, groups=8,
-            cheb_deg=6, cheb_laplacian="path_causal",
-            skew_rank=8, R_rank=4,
-            steps=2, dt=0.5, method="heun",
-            tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
-            pad_id=0,
-            lr=3e-3, weight_decay=0.0,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            use_gauge=True,
-            stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
-            scheduler_name="warmup_cosine",
-            scheduler_total_steps=200,
-            scheduler_warmup_steps=20,
-            scheduler_min_lr=3e-4,
-            profile=False, profile_nvtx=False, profile_log_mem=False,
-            checkpoint_dir="./ckpts", save_every=0, keep_last_k=5, best_metric_name="loss",
-        ))
+        cfg_source_path = default_hf_path
+        base_dict = _load_hf_like_config(default_hf_path)
+        if not base_dict:
+            logging.warning(f"[hf] default config not found at {default_hf_path}; falling back to tiny internal default.")
+            base_dict = asdict(LoopConfig(
+                W=16, O=4,
+                vocab_size=128, d_model=64, groups=8,
+                cheb_deg=6, cheb_laplacian="path_causal",
+                skew_rank=8, R_rank=4,
+                steps=2, dt=0.5, method="heun",
+                tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
+                pad_id=0,
+                lr=3e-3, weight_decay=0.0,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                use_gauge=True,
+                stitch_w=0.1, stitch_use_lowd=True, stitch_use_skl=False,
+                scheduler_name="warmup_cosine",
+                scheduler_total_steps=200,
+                scheduler_warmup_steps=20,
+                scheduler_min_lr=3e-4,
+                profile=False, profile_nvtx=False, profile_log_mem=False,
+                checkpoint_dir="./ckpts", save_every=0, keep_last_k=5, best_metric_name="loss",
+            ))
 
     # Helper to load HF-like config (utils.hf_config or plain JSON)
     def _load_hf_like_config(path: str) -> Dict[str, Any]:
@@ -709,26 +806,44 @@ def main(argv: Optional[List[str]] = None) -> None:
         "state_mask": getattr(args, "state_mask", None),
         "state_kind": getattr(args, "state_kind", None),
         "target_bpp": getattr(args, "target_bpp", None),
+        # gate / op-bank
+        "use_gate": args.use_gate,
+        "gate_topk": args.gate_topk,
+        "gate_per_channel": args.gate_per_channel,
+        "gate_gamma": args.gate_gamma,
+        "use_op_bank": args.use_op_bank,
+        "gate_topk_real": args.gate_topk_real,
+        # nonlinear diffusion
+        "nl_diffusion_enabled": args.nl_diffusion_enabled,
+        "nl_p": args.nl_p,
+        "nl_huber_delta": args.nl_huber_delta,
+        "nl_a_min": args.nl_a_min,
+        "nl_a_max": args.nl_a_max,
+        "nl_recompute_iters": args.nl_recompute_iters,
+        "nl_reduce": args.nl_reduce,
+        # PH nonlinear core
+        "ph_nl_enabled": args.ph_nl_enabled,
+        "ph_use_nl_R": args.ph_use_nl_R,
+        "ph_use_nl_H": args.ph_use_nl_H,
+        "ph_nl_rank": args.ph_nl_rank,
+        # output head multiplicative
+        "head_use_mul": args.head_use_mul,
+        "head_mul_rank": args.head_mul_rank,
+        "head_mul_gate_init": args.head_mul_gate_init,
+        # integrator debug extras
+        "debug_log_A": args.debug_log_A,
+        "debug_log_gate": args.debug_log_gate,
+        "debug_energy": args.debug_energy,
+        # regularizers
+        "reg_gate_l0": args.reg_gate_l0,
+        "reg_gate_from_logits": args.reg_gate_from_logits,
+        "reg_op_decor": args.reg_op_decor,
+        "reg_energy_osc": args.reg_energy_osc,
+        "reg_energy_hinge": args.reg_energy_hinge,
     }
 
-    # --- Determine base config source and merge order ---
-    # - If user passes --hf-config, use that.
-    # - Else, if configs/config.json exists, use it as default.
-    # - Else, fall back to preset_dict computed above.
-    hf_dict = {}
-    user_hf_path = args.hf_config
-    default_hf_path = os.path.join("configs", "config.json")
-    if user_hf_path is not None:
-        hf_dict = _load_hf_like_config(user_hf_path)
-    elif os.path.exists(default_hf_path):
-        logging.info(f"[hf] using default config at {default_hf_path}")
-        hf_dict = _load_hf_like_config(default_hf_path)
-    else:
-        logging.info("[hf] no HF-style config found; using preset base.")
-
-    # Merge order: base (hf if present, else preset) -> CLI overrides
-    base = hf_dict if hf_dict else preset_dict
-    merged = merge_cfg(base, overrides)
+    # Merge order: base_dict -> CLI overrides
+    merged = merge_cfg(base_dict, overrides)
 
     # Warn if user or base config selected a non-causal Laplacian for AR LM
     if merged.get("cheb_laplacian") == "path":
@@ -741,6 +856,21 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     merged = _sanitize_for_loopconfig(merged)
     cfg = LoopConfig(**merged)  # type: ignore[arg-type]
+
+    # Save resolved config back to disk (overwrite source config) and into ckpt dir
+    resolved_dict = asdict(cfg)
+    try:
+        if cfg_source_path is not None:
+            out_cfg_path = _save_hf_like_config(resolved_dict, cfg_source_path)
+            logging.info(f"[hf] saved resolved config to: {out_cfg_path}")
+    except Exception as e:
+        logging.warning(f"[hf] failed to save resolved config to source path: {e}")
+    try:
+        if getattr(cfg, "checkpoint_dir", None):
+            ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+            _save_hf_like_config(resolved_dict, ck_cfg_path)
+    except Exception as e:
+        logging.warning(f"[hf] failed to write config copy into checkpoint_dir: {e}")
 
     # Steps: CLI --steps wins; else take scheduler_total_steps (if given); else 400
     steps = args.steps if args.steps is not None else (cfg.scheduler_total_steps or 400)
@@ -979,6 +1109,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=asdict(cfg),
                 every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
             )
+            try:
+                if getattr(cfg, "checkpoint_dir", None):
+                    ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+                    _save_hf_like_config(asdict(cfg), ck_cfg_path)
+            except Exception:
+                pass
             ran_val = False
             if int(args.val_every) > 0 and (s > start_step) and ((s % int(args.val_every)) == 0):
                 # nested tqdm for validation; resumes outer pbar after it finishes
@@ -990,6 +1126,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
                     step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
                 )
+                try:
+                    if getattr(cfg, "checkpoint_dir", None):
+                        ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+                        _save_hf_like_config(asdict(cfg), ck_cfg_path)
+                except Exception:
+                    pass
                 ran_val = True
             if not ran_val:
                 metric_name = cfg.best_metric_name
@@ -999,6 +1141,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                         metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
                         step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
                     )
+                    try:
+                        if getattr(cfg, "checkpoint_dir", None):
+                            ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+                            _save_hf_like_config(asdict(cfg), ck_cfg_path)
+                    except Exception:
+                        pass
 
             # Scheduler step: non-plateau every step; plateau only on validation
             if sch is not None:
@@ -1183,6 +1331,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             model=model, optimizer=opt, scheduler=None, step=s, epoch=0, cfg=asdict(cfg),
             every=cfg.save_every, extra={"tokens_seen": int(stats.get("tokens", 0))}
         )
+        try:
+            if getattr(cfg, "checkpoint_dir", None):
+                ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+                _save_hf_like_config(asdict(cfg), ck_cfg_path)
+        except Exception:
+            pass
         metric_name = cfg.best_metric_name
         metric_val = float(stats.get(metric_name, stats.get("loss", 0.0)))
         if int(args.best_every) <= 1 or (s % int(args.best_every) == 0):
@@ -1190,6 +1344,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 metric_value=metric_val, model=model, optimizer=opt, scheduler=None,
                 step=s, epoch=0, cfg=asdict(cfg), extra={metric_name: metric_val}
             )
+            try:
+                if getattr(cfg, "checkpoint_dir", None):
+                    ck_cfg_path = os.path.join(cfg.checkpoint_dir, "config.resolved.json")
+                    _save_hf_like_config(asdict(cfg), ck_cfg_path)
+            except Exception:
+                pass
 
         # Scheduler step: non-plateau every step; plateau only on validation
         # For text fallback, always use stats for metric_val

@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
+#
 # ------------------------------ safe imports ----------------------------------
 # When executed as a script (python train/loop.py), make repo root importable.
 if __package__ in (None, ""):
@@ -36,12 +37,18 @@ except Exception:
 from utils.windows import slice_windows, reconstruct_from_windows
 from modules.normalize import groupwise_norm
 from operators.cheb import ChebFilter1D
+# Optional advective operator (used only if use_op_bank=True and available)
+try:
+    from operators.advective import Advective1D as _AdvectiveClass  # type: ignore
+except Exception:
+    _AdvectiveClass = None  # type: ignore
 from modules.portham import PortHamiltonianStep
 from modules.integrator import Integrator
 from modules.output_head import OutputHead
 from losses.task_loss import sequence_cross_entropy, shift_for_next_token
 from losses.rate_loss import bits_per_token
 from losses.stitching_loss import StitchingOverlapLoss
+from losses.regularizers import gate_l0_proxy, opbank_cosine_decorrelation, energy_oscillation_penalty
 from optim.sda import DualSDA
 from modules.quant import calibrate_model, toggle_fakequant_collect
 from train.checkpoints import CheckpointManager  # checkpoint management
@@ -61,6 +68,12 @@ except Exception:
         from modules.gauge import Gauge as _GaugeClass  # type: ignore
     except Exception:
         _GaugeClass = None  # type: ignore
+
+# ------------------------------ optional gate ---------------------------------
+try:
+    from modules.gate import GroupGate as _GateClass  # type: ignore
+except Exception:
+    _GateClass = None  # type: ignore
 
 
 # ------------------------------- config dataclass ------------------------------
@@ -94,6 +107,41 @@ class LoopConfig:
     factor_rank: Optional[int] = None
     pos_kind: str = "sinusoidal"
     pad_id: int = 0
+
+    # integrator nonlinearity blocks
+    nl_diffusion_enabled: bool = False
+    nl_p: float = 1.5
+    nl_huber_delta: float = 1e-3
+    nl_a_min: float = 0.2
+    nl_a_max: float = 5.0
+    nl_recompute_iters: int = 1
+    nl_reduce: str = "group"  # or "channel"
+
+    # port-hamiltonian nonlinear options (field-side)
+    ph_nl_enabled: bool = False
+    ph_use_nl_R: bool = False
+    ph_use_nl_H: bool = False
+    ph_nl_rank: int = 8
+
+    # gate options
+    use_gate: bool = False
+    gate_topk: int = 2
+    gate_per_channel: bool = False
+    gate_gamma: float = 1.2
+
+    # operator bank / top-k real
+    use_op_bank: bool = False
+    gate_topk_real: int = 2
+
+    # output head multiplicative branch
+    head_use_mul: bool = False
+    head_mul_rank: int = 16
+    head_mul_gate_init: float = 0.0
+
+    # extra debug toggles
+    debug_log_A: bool = False    # print p-Lap params/clamps once
+    debug_log_gate: bool = False # print gate config once
+    debug_energy: bool = False   # log E_pre/E_post for a sample
 
     # optimization
     lr: float = 3e-4
@@ -135,8 +183,6 @@ class LoopConfig:
     best_metric_name: str = "loss" # which stat to track as "best" (e.g., 'loss' or 'bpp')
     resume_path: Optional[str] = None
 
-
-
     # scheduler (optional)
     scheduler_name: Optional[str] = None  # e.g., 'warmup_cosine', 'warmup_linear', 'noam', 'plateau'
     scheduler_total_steps: int = 0        # if 0, demo will default to 40
@@ -167,6 +213,13 @@ class LoopConfig:
     state_mask: str = "all"             # 'all' or 'collar'
     state_kind: str = "energy_contract" # future-proof: one kind for now
 
+    # regularizers (optional)
+    reg_gate_l0: float = 0.0            # weight for L0-like gate sparsity
+    reg_gate_from_logits: bool = False  # if True, interpret gate input as logits
+    reg_op_decor: float = 0.0           # weight for operator output decorrelation
+    reg_energy_osc: float = 0.0         # tiny penalty for energy increases across steps
+    reg_energy_hinge: float = 0.0       # margin before penalizing energy increases
+
 
 # ----------------------------------- model ------------------------------------
 
@@ -187,10 +240,12 @@ class ContinuousBlock(nn.Module):
         dt: float,
         method: str,
         use_gauge: bool,
+        use_op_bank: bool = False,
     ):
         super().__init__()
         self.d = d
         self.groups = groups
+        self._use_op_bank = bool(use_op_bank)
 
         # Optional gauge (capacity scaling). If not present, identity.
         if use_gauge and _GaugeClass is not None:
@@ -201,6 +256,12 @@ class ContinuousBlock(nn.Module):
         else:
             self.gauge = nn.Identity()
 
+        # ---------------- gate (optional, attached by LM if requested) ----------------
+        if use_gauge and _GateClass is not None and True:  # gate is independent from gauge flag
+            self.gate = None  # placeholder; created in LM using cfg
+        else:
+            self.gate = None
+
         # Chebyshev spectral filter over time axis.
         # IMPORTANT FIX: ChebFilter1D signature does NOT take `d`; use K/groups/laplacian.
         lap_mode = laplacian  # expected in {'path_causal','path','cycle'}
@@ -208,9 +269,21 @@ class ContinuousBlock(nn.Module):
 
         # Port-Hamiltonian field + integrator
         self.field = PortHamiltonianStep(
-            d=d, groups=groups, skew_rank=skew_rank, R_rank=R_rank, traceless=True
+            d=d, groups=groups, skew_rank=skew_rank, R_rank=R_rank, traceless=True,
+            use_nl_R=getattr(self, "_ph_use_nl_R", False),
+            use_nl_H=getattr(self, "_ph_use_nl_H", False),
+            nl_rank=getattr(self, "_ph_nl_rank", 8),
         )
         self.integ = Integrator(self.field, method=method, dt=dt, steps=integ_steps)
+
+        # Optional operator bank inside PortHamiltonianStep (for ctx/top-k real)
+        if self._use_op_bank and hasattr(self.field, 'set_op_bank'):
+            # Causal-safe by default: only include Chebyshev (path_causal Laplacian)
+            ops = [self.cheb]
+            try:
+                self.field.set_op_bank(ops)
+            except Exception:
+                pass
 
     def forward(self, x: torch.Tensor, step_hook=None) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -233,11 +306,39 @@ class ContinuousBlock(nn.Module):
                 cap = torch.ones(x.size(0), x.size(1), 1, device=x.device, dtype=x.dtype)
                 g = self.gauge(x, cap)  # type: ignore
 
-        # Chebyshev filter (temporal operator)
-        y = self.cheb(g)  # API computes its own 1D Laplacian per window length and mode
+        # Chebyshev filter (or defer to op-bank if enabled)
+        if getattr(self, '_use_op_bank', False) and getattr(self.field, 'op_bank', None):
+            y = g  # defer ops to field via op_bank
+        else:
+            y = self.cheb(g)
 
         # Integrate Port-Hamiltonian dynamics
-        z = self.integ(y, step_hook=step_hook)  # [B', W, D]
+        integ_kwargs = {}
+        # gate (if the LM attached one)
+        if getattr(self, "gate", None) is not None:
+            integ_kwargs.update({
+                "gate": self.gate,
+                "gate_kwargs": {"topk_real": int(getattr(self, "_gate_topk_real", 2))},
+            })
+        # nl diffusion
+        if getattr(self, "_nl_enabled", False):
+            integ_kwargs["nl_diffusion"] = {
+                "enabled": True,
+                "p": float(getattr(self, "_nl_p", 1.5)),
+                "huber_delta": float(getattr(self, "_nl_huber_delta", 1e-3)),
+                "a_min": float(getattr(self, "_nl_a_min", 0.2)),
+                "a_max": float(getattr(self, "_nl_a_max", 5.0)),
+                "recompute_iters": int(getattr(self, "_nl_recompute_iters", 1)),
+                "reduce": str(getattr(self, "_nl_reduce", "group")),
+                "causal": True,
+            }
+        # ph-nl use
+        if getattr(self, "_ph_enabled", False):
+            integ_kwargs["ph_nl"] = {"enabled": True}
+        # groups for operators along channel dim
+        integ_kwargs["groups"] = int(self.groups)
+
+        z = self.integ(y, step_hook=step_hook, **integ_kwargs)  # [B', W, D]
         return z, y
 
 
@@ -273,7 +374,31 @@ class ContinuousLM(nn.Module):
             dt=cfg.dt,
             method=cfg.method,
             use_gauge=cfg.use_gauge,
+            use_op_bank=cfg.use_op_bank,
         )
+        self.block._gate_topk_real = int(cfg.gate_topk_real)
+        # Propagate PH-NL flags
+        self.block._ph_enabled   = bool(cfg.ph_nl_enabled)
+        self.block._ph_use_nl_R  = bool(cfg.ph_use_nl_R)
+        self.block._ph_use_nl_H  = bool(cfg.ph_use_nl_H)
+        self.block._ph_nl_rank   = int(cfg.ph_nl_rank)
+        # Propagate NL diffusion flags
+        self.block._nl_enabled         = bool(cfg.nl_diffusion_enabled)
+        self.block._nl_p               = float(cfg.nl_p)
+        self.block._nl_huber_delta     = float(cfg.nl_huber_delta)
+        self.block._nl_a_min           = float(cfg.nl_a_min)
+        self.block._nl_a_max           = float(cfg.nl_a_max)
+        self.block._nl_recompute_iters = int(cfg.nl_recompute_iters)
+        self.block._nl_reduce          = str(cfg.nl_reduce)
+        # Optional gate
+        if cfg.use_gate and (_GateClass is not None):
+            self.gate = _GateClass(d_model=cfg.d_model, groups=cfg.groups, mode="mul",
+                                   per_channel=bool(cfg.gate_per_channel),
+                                   sparse_topk=int(max(1, cfg.gate_topk)),
+                                   gamma=float(cfg.gate_gamma))
+            self.block.gate = self.gate
+        else:
+            self.gate = None
 
         # Canonical naming: the logits projection is `self.head` only.
         # We do not export `lm_head.*` aliases in state_dict; inference must use `head`.
@@ -284,9 +409,19 @@ class ContinuousLM(nn.Module):
             get_tied=(lambda: (self.embed._effective_token_weight(), self.embed.out_bias)) if cfg.tie_softmax else None,
             learn_bias=cfg.tie_softmax and (self.embed.out_bias is None),
             temperature=1.0,
+            use_mul=bool(cfg.head_use_mul),
+            mul_rank=int(cfg.head_mul_rank),
+            mul_gate_init=float(cfg.head_mul_gate_init),
         )
+        # Ensure compatibility with checkpoints that include a scalar output scale
+        # Register inside the head module so the state_dict key is exactly 'head.weight_mul'
+        if not hasattr(self.head, 'weight_mul'):
+            self.head.register_parameter('weight_mul', nn.Parameter(torch.ones(())))
 
         # --- debug flags (cfg-only; set via arguments/config) ---
+        self._aux_gate_pen = None
+        self._aux_decor_pen = None
+        self._aux_energy_pen = None
         self._debug_align = bool(cfg.debug_align)
         self._debug_align_every = int(max(1, cfg.debug_align_every))
         self._debug_state_norm = bool(cfg.debug_state_norm)
@@ -319,6 +454,14 @@ class ContinuousLM(nn.Module):
 
         # Capacity/telemetry ledger (entropy-based capacity signal)
         self.ledger = CapacityLedger(vocab_size=cfg.vocab_size, ema_alpha=0.9)
+
+        # --- Debug/sanity logs for new features ---
+        if cfg.debug_log_gate and (self.gate is not None):
+            logging.info(f"[cfg] gate enabled: topk={cfg.gate_topk}, per_channel={cfg.gate_per_channel}, gamma={cfg.gate_gamma}")
+        if cfg.debug_log_A and bool(cfg.nl_diffusion_enabled):
+            logging.info(f"[cfg] p-Lap enabled: p={cfg.nl_p}, δ={cfg.nl_huber_delta}, a∈[{cfg.nl_a_min},{cfg.nl_a_max}], recompute={cfg.nl_recompute_iters}, reduce={cfg.nl_reduce}")
+        if cfg.ph_nl_enabled:
+            logging.info(f"[cfg] PH-NL enabled: use_nl_R={cfg.ph_use_nl_R}, use_nl_H={cfg.ph_use_nl_H}, nl_rank={cfg.ph_nl_rank}")
 
     @torch.no_grad()
     def _shape_windows(self, h: torch.Tensor) -> Tuple[torch.Tensor, int, int, int, int]:
@@ -443,6 +586,11 @@ class ContinuousLM(nn.Module):
             h_pre: [B, T, D]  # pre-integration (Chebyshev) hidden, reconstructed
             h_post: [B, T, D] # post-integration hidden, reconstructed
         """
+        # clear aux penalties for this call
+        self._aux_gate_pen = None
+        self._aux_decor_pen = None
+        self._aux_energy_pen = None
+
         # 1) Embed tokens -> [B, T, D]
         h0 = self.embed(tokens)
 
@@ -452,13 +600,42 @@ class ContinuousLM(nn.Module):
         use_border_only = self.training and self.cfg.grads_border_only and (O > 0) and (W > 2 * O)
 
         # Decide whether to log integrator steps
-        want_integ_log = (self._debug_state_norm or self._debug_align)
+        want_integ_log = (self._debug_state_norm or self._debug_align or 
+                          self.cfg.debug_log_A or self.cfg.debug_log_gate or self.cfg.debug_energy)
         # step gating: log at step 0 and every _debug_align_every steps
         step_gate = (self._debug_step % self._debug_align_every == 0)
         want_integ_log = want_integ_log and step_gate
+
+        def _pretty_integ(info: Dict[str, float]) -> str:
+            parts = []
+            # time/step
+            if 's_idx' in info and 'dt' in info:
+                parts.append(f"s={int(info['s_idx'])}, dt={info['dt']:.3f}")
+            # gate stats
+            if 'gate_ent' in info:
+                parts.append(f"gate_ent={info['gate_ent']:.3f}")
+            if 'gate_active' in info:
+                parts.append(f"gate_active={info['gate_active']:.2f}")
+            # diffusion A(h) stats
+            if 'A_mean' in info:
+                parts.append(f"Aμ={info['A_mean']:.3f}")
+            if 'A_min' in info and 'A_max' in info:
+                parts.append(f"A∈[{info['A_min']:.3f},{info['A_max']:.3f}]")
+            # simple energies
+            if 'E_pre' in info and 'E_post' in info:
+                parts.append(f"E: {info['E_pre']:.3f}→{info['E_post']:.3f}")
+            # fallback: any other interesting keys
+            for k in sorted(info.keys()):
+                if k in ('s_idx','dt','gate_ent','gate_active','A_mean','A_min','A_max','E_pre','E_post'):
+                    continue
+                v = info[k]
+                if isinstance(v, (int, float)):
+                    parts.append(f"{k}={float(v):.3f}")
+            return " | ".join(parts) if parts else str(info)
+
         if want_integ_log:
             def integ_hook(info: Dict[str, float]):
-                logging.info(f"[integ] {info}")
+                logging.info(f"[integ] {_pretty_integ(info)}")
         else:
             integ_hook = None
 
@@ -489,16 +666,85 @@ class ContinuousLM(nn.Module):
             # full-grad path
             y_post, y_pre = self.block(xw, step_hook=integ_hook)
 
+        # --- optional regularizers on windowed tensors ---
+        try:
+            if (self.gate is not None) and (float(self.cfg.reg_gate_l0) > 0.0):
+                # Try to obtain gate weights by reusing gate on pre-integrated features
+                y_for_gate = y_pre  # [B*nw, W, D]
+                out_gate = None
+                try:
+                    out_gate = self.block.gate(y_for_gate, return_gate=True)
+                except TypeError:
+                    # some gate impls may not accept return_gate; attempt without and skip
+                    out_gate = None
+                if isinstance(out_gate, (tuple, list)) and len(out_gate) >= 2:
+                    w = out_gate[1]
+                    # interpret as probs by default
+                    pen = gate_l0_proxy(w, coeff=float(self.cfg.reg_gate_l0), from_logits=bool(self.cfg.reg_gate_from_logits))
+                    self._aux_gate_pen = pen.to(y_for_gate)
+        except Exception:
+            pass
+
+        try:
+            if bool(self.cfg.use_op_bank) and (float(self.cfg.reg_op_decor) > 0.0) and getattr(self.block.field, 'op_bank', None):
+                # Evaluate each operator once on the same pre state and decorrelate their pooled outputs
+                Ys = []
+                for op in list(self.block.field.op_bank):
+                    try:
+                        Ys.append(op.op(y_pre, ctx=None))  # [B*nw, W, D]
+                    except Exception:
+                        pass
+                if len(Ys) >= 2:
+                    pen = opbank_cosine_decorrelation(Ys, coeff=float(self.cfg.reg_op_decor))
+                    self._aux_decor_pen = pen.to(y_pre)
+        except Exception:
+            pass
+
         # 3) Save hidden by window for stitching (post-integration)
         y_win_bnwd = y_post.view(B, nwin, W, D)  # [B, n_win, W, D]
 
         # 4) Reconstruct sequences (both post and pre states)
         h_post = self._unshape_and_reconstruct(y_post, B, T, D, nwin)        # [B, T, D]
         h_pre  = self._unshape_and_reconstruct(y_pre,  B, T, D, nwin)        # [B, T, D]
+
+        # Energy oscillation penalty (post/pre reconstructed)
+        if float(self.cfg.reg_energy_osc) > 0.0:
+            with torch.no_grad():
+                E_pair = torch.stack([
+                    (h_pre*h_pre).mean(),
+                    (h_post*h_post).mean()
+                ], dim=0)  # [2]
+            self._aux_energy_pen = energy_oscillation_penalty(E_pair, coeff=float(self.cfg.reg_energy_osc), hinge=float(self.cfg.reg_energy_hinge)).to(h_pre)
+
         logits = self.head(h_post, mask=None, mask_behavior="none", traceless=True)  # [B, T, V]
+        # Apply legacy output scaling only if shape is safe (scalar or per-vocab [V]).
+        # Newer checkpoints use multiplicative branches inside OutputHead and should NOT be re-scaled here.
+        wm = getattr(self.head, 'weight_mul', None)
+        if isinstance(wm, nn.Parameter):
+            try:
+                if wm.ndim == 0:
+                    # scalar: ok
+                    logits = logits * wm
+                elif wm.ndim == 1 and wm.shape[0] == logits.shape[-1]:
+                    # per-vocab vector [V]: ok
+                    logits = logits * wm
+                else:
+                    # Any other shape (e.g., [D], [V,D], [D,V]) is handled inside OutputHead; skip here.
+                    logging.info(
+                        f"[loop] skip external weight_mul scale (shape={tuple(wm.shape)} not in {{(), (V,)}}); handled by OutputHead."
+                    )
+            except Exception as e:
+                logging.warning(f"[loop] failed to apply legacy weight_mul scaling: {e}")
 
         # 5) Optional debug (state norms / CE alignment)
         self._maybe_debug_state(h_post, logits, tokens, mask)
+
+        # --- debug energy log ---
+        if self.cfg.debug_energy:
+            with torch.no_grad():
+                e_pre = float((h_pre*h_pre).mean().item())
+                e_post = float((h_post*h_post).mean().item())
+                logging.info(f"[debug] energy: E_pre={e_pre:.4f} → E_post={e_post:.4f}")
 
         # 6) Prepare logits per window if SKL is enabled
         logits_win = None
@@ -601,9 +847,9 @@ class ContinuousLM(nn.Module):
                 if mask is not None:
                     state_mask_bt = state_mask_bt & mask.bool()
             elif 'targets_s' in locals():
-                # legacy path uses original mask (pre-shift) if available
-                if mask is not None:
-                    state_mask_bt = state_mask_bt & mask.bool()
+                # legacy path must use the shifted mask to match T after shift
+                if 'mask_s' in locals() and (mask_s is not None):
+                    state_mask_bt = state_mask_bt & mask_s.bool()
             # Extra alignment check (masked fraction only as info)
             if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
                 with torch.no_grad():
@@ -680,9 +926,9 @@ class ContinuousLM(nn.Module):
                 if mask is not None:
                     state_mask_bt = state_mask_bt & mask.bool()
             elif 'targets_s' in locals():
-                # legacy path uses original mask (pre-shift) if available
-                if mask is not None:
-                    state_mask_bt = state_mask_bt & mask.bool()
+                # legacy path must use the shifted mask to match T after shift
+                if 'mask_s' in locals() and (mask_s is not None):
+                    state_mask_bt = state_mask_bt & mask_s.bool()
             # Extra alignment check (masked fraction only as info)
             if self._debug_align and ((self._debug_step % max(1, self._debug_align_every)) == 1):
                 with torch.no_grad():
@@ -762,6 +1008,17 @@ class ContinuousLM(nn.Module):
                 **st_e,
             })
 
+        # Add optional regularizers collected in forward_tokens
+        if isinstance(self._aux_gate_pen, torch.Tensor):
+            loss = loss + self._aux_gate_pen
+            stats["loss_gate_l0"] = float(self._aux_gate_pen.detach().item())
+        if isinstance(self._aux_decor_pen, torch.Tensor):
+            loss = loss + self._aux_decor_pen
+            stats["loss_op_decor"] = float(self._aux_decor_pen.detach().item())
+        if isinstance(self._aux_energy_pen, torch.Tensor):
+            loss = loss + self._aux_energy_pen
+            stats["loss_energy_osc"] = float(self._aux_energy_pen.detach().item())
+
         # Dual penalty in log-space with variance-aware normalization (unchanged)
         if self.sda is not None and ("bpp" in stats):
             with torch.no_grad():
@@ -835,7 +1092,7 @@ if __name__ == "__main__":
                 vocab_size=vocab.size, d_model=64, groups=8,
                 cheb_deg=6, cheb_laplacian="path_causal",
                 skew_rank=8, R_rank=4,
-                steps=2, dt=0.5, method="heun",
+                steps=2, dt=0.5, method="ph-strang-nl",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
                 pad_id=vocab.pad_id,
                 lr=3e-3, weight_decay=0.0,
@@ -846,6 +1103,9 @@ if __name__ == "__main__":
                 scheduler_total_steps=40,
                 scheduler_warmup_steps=5,
                 scheduler_min_lr=3e-4,
+                nl_diffusion_enabled=True,
+                head_use_mul=True,
+                use_op_bank=True,
             )
             batch["collar_mask"] = _build_collar_mask(lens, W=cfg.W, O=cfg.O)
         else:
@@ -854,7 +1114,7 @@ if __name__ == "__main__":
                 vocab_size=vocab.size, d_model=64, groups=8,
                 cheb_deg=6, cheb_laplacian="path_causal",
                 skew_rank=8, R_rank=4,
-                steps=2, dt=0.5, method="heun",
+                steps=2, dt=0.5, method="ph-strang-nl",
                 tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
                 pad_id=vocab.pad_id,
                 lr=3e-3, weight_decay=0.0,
@@ -865,6 +1125,9 @@ if __name__ == "__main__":
                 scheduler_total_steps=40,
                 scheduler_warmup_steps=5,
                 scheduler_min_lr=3e-4,
+                nl_diffusion_enabled=True,
+                head_use_mul=True,
+                use_op_bank=True,
             )
     else:
         tokens, mask = pack_batch(seqs, pad_id=vocab.pad_id)
@@ -874,7 +1137,7 @@ if __name__ == "__main__":
             vocab_size=vocab.size, d_model=64, groups=8,
             cheb_deg=6, cheb_laplacian="path_causal",
             skew_rank=8, R_rank=4,
-            steps=2, dt=0.5, method="heun",
+            steps=2, dt=0.5, method="ph-strang-nl",
             tie_softmax=True, factor_rank=16, pos_kind="sinusoidal",
             pad_id=vocab.pad_id,
             lr=3e-3, weight_decay=0.0,
@@ -888,7 +1151,9 @@ if __name__ == "__main__":
             profile=True,
             profile_nvtx=False,
             profile_log_mem=True,
-            
+            nl_diffusion_enabled=True,
+            head_use_mul=True,
+            use_op_bank=True,
         )
 
     device = torch.device(cfg.device)

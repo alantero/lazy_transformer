@@ -19,6 +19,9 @@
 #       - mask supports shapes [B,T], [B,T,1], [B,T,G], [B,T,D].
 #       - For mode='residual', positions where mask==False pass x unchanged (g=0).
 #       - For mode='mul', positions where mask==False pass x unchanged (no multiplicative gating).
+#   • Optional sparse top-k gating (sparse_topk) applies per-token sparsification on the gating dimension
+#       (per-group or per-channel depending on configuration) by masking non-topk entries before the squashing function.
+#   • Optional gamma shaping (gamma>0) raises the squashed gate to a power to sharpen or flatten the gate distribution.
 #
 # No dependencies beyond torch.
 
@@ -50,6 +53,9 @@ class GroupGate(nn.Module):
       learn_temp:    learn a global logit scale (temperature) (default False → fixed = 1.0)
       cap_scale_init:initial scalar to scale external 'cap' signal in logits (0.0 disables by default)
       stop_grad_cap: if True (default), detach() the external 'cap' signal before mixing (no gradient through cap).
+      sparse_topk:   Optional[int] (default None). If set, applies per-token top-k sparsification on gating dimension
+                     (per-group or per-channel depending on configuration) by masking non-topk entries before sigmoid.
+      gamma:         float > 0 (default 1.0). Raises the squashed gate to this power to sharpen (>1) or flatten (<1) the gate distribution.
 
     Forward:
       If mode == 'residual':
@@ -84,6 +90,8 @@ class GroupGate(nn.Module):
         learn_temp: bool = False,
         cap_scale_init: float = 0.0,
         stop_grad_cap: bool = True,
+        sparse_topk: Optional[int] = None,
+        gamma: float = 1.0,
         dtype: Optional[torch.dtype] = torch.float32,
     ):
         super().__init__()
@@ -91,11 +99,25 @@ class GroupGate(nn.Module):
             raise ValueError("d_model must be > 0.")
         _ensure_divisible(d_model, groups)
 
+        if gamma <= 0:
+            raise ValueError("gamma must be > 0.")
+        if sparse_topk is not None:
+            if sparse_topk < 1:
+                raise ValueError("sparse_topk must be >= 1 if specified.")
+            if per_channel:
+                if sparse_topk > d_model // groups:
+                    raise ValueError(f"sparse_topk must be <= channels per group (cg={d_model // groups}) when per_channel=True.")
+            else:
+                if sparse_topk > groups:
+                    raise ValueError(f"sparse_topk must be <= groups ({groups}) when per_channel=False.")
+
         self.d_model = int(d_model)
         self.groups = int(groups)
         self.cg = self.d_model // self.groups
         self.mode: _Mode = mode
         self.per_channel = bool(per_channel)
+        self.sparse_topk = sparse_topk
+        self.gamma = float(gamma)
 
         # Gate logits parameters
         factory_kwargs = {"dtype": dtype}
@@ -171,6 +193,7 @@ class GroupGate(nn.Module):
         Build gate tensor g in [0,1] with shape [B, T, D].
         g = sigmoid( logit_scale * (logits_full + cap_scale * cap_full) )
         If mask is provided (False=invalid), gates on invalid positions are zeroed.
+        Supports optional sparse_topk gating and gamma shaping.
         """
         if self.per_channel:
             logits_full = self.logits.to(device=device, dtype=dtype)                  # [D]
@@ -191,7 +214,36 @@ class GroupGate(nn.Module):
                 capD = capD * maskD_bool.to(dtype)                                   # ignore cap on invalid tokens
             logitsBTD = logitsBTD + self.cap_scale.to(device=device, dtype=dtype) * capD
 
-        g = torch.sigmoid(self.logit_scale.to(device=device, dtype=dtype) * logitsBTD)
+        scores = self.logit_scale.to(device=device, dtype=dtype) * logitsBTD  # [B,T,D]
+
+        if self.sparse_topk is not None:
+            k = self.sparse_topk
+            if self.per_channel:
+                # scores shape [B,T,D] -> reshape to [B,T,G,Cg]
+                scores4d = scores.view(B, T, self.groups, self.cg)
+                # topk along last dim (channels per group)
+                topk_vals, topk_idx = torch.topk(scores4d, k=k, dim=-1)
+                mask_topk = torch.zeros_like(scores4d, dtype=torch.bool)
+                mask_topk.scatter_(-1, topk_idx, True)
+                # mask non-topk entries to large negative
+                scores4d = scores4d.masked_fill(~mask_topk, -20.0)
+                scores = scores4d.view(B, T, self.d_model)
+            else:
+                # per-group topk: compute group scores by averaging channels per group
+                scores4d = scores.view(B, T, self.groups, self.cg)
+                group_scores = scores4d.mean(dim=-1)  # [B,T,G]
+                topk_vals, topk_idx = torch.topk(group_scores, k=k, dim=-1)
+                mask_topkG = torch.zeros_like(group_scores, dtype=torch.bool)
+                mask_topkG.scatter_(-1, topk_idx, True)  # [B,T,G]
+                # expand mask to channels
+                mask_topk4d = mask_topkG.unsqueeze(-1).expand(B, T, self.groups, self.cg)
+                scores4d = scores4d.masked_fill(~mask_topk4d, -20.0)
+                scores = scores4d.view(B, T, self.d_model)
+
+        g = torch.sigmoid(scores)
+
+        if self.gamma != 1.0:
+            g = g.pow(self.gamma)
 
         if maskD_bool is not None:
             g = g * maskD_bool.to(dtype)  # zero-out gates on invalid tokens
@@ -300,5 +352,40 @@ if __name__ == "__main__":
     assert torch.allclose(y_mul[:, 0, :], x[:, 0, :], atol=1e-6), "Mul gate must pass x through on masked positions."
 
     print("  mask passthrough: OK")
+
+    # 5) Sparse top-k gating per-group test
+    g_topk = GroupGate(d_model=D, groups=G, mode="mul", per_channel=False, bias_init=-20.0, sparse_topk=1)
+    with torch.no_grad():
+        # set logits so that first two groups are very high, last is low
+        g_topk.logits.fill_(-20.0)
+        g_topk.logits[0] = 10.0
+        g_topk.logits[1] = 9.0
+        g_topk.logits[2] = -10.0
+    y_topk, gate_topk = g_topk(x, return_gate=True)
+    # average gate per group
+    gate_topk_reshaped = gate_topk.view(B, T, G, D // G)
+    gate_topk_group_means = gate_topk_reshaped.mean(dim=-1)  # [B,T,G]
+    # check that only one group is effectively open per token (topk=1)
+    max_group_gate = gate_topk_group_means.max(dim=-1).values  # [B,T]
+    other_groups_gate = gate_topk_group_means.sum(dim=-1) - max_group_gate  # [B,T]
+    print(f"  sparse_topk per-group: max group mean gate >> others? max={max_group_gate.mean():.3f}, others={other_groups_gate.mean():.3f}")
+    assert (max_group_gate > other_groups_gate).all(), "Only one group should be open per token with sparse_topk=1."
+
+    # 6) Gamma shaping test
+    g_gamma1 = GroupGate(d_model=D, groups=G, mode="mul", per_channel=True, bias_init=0.0, gamma=1.0)
+    g_gamma2 = GroupGate(d_model=D, groups=G, mode="mul", per_channel=True, bias_init=0.0, gamma=2.0)
+    with torch.no_grad():
+        g_gamma1.logits.fill_(0.0)
+        g_gamma2.logits.fill_(0.0)
+    gate1 = g_gamma1._gate(B, T, device=x.device, dtype=x.dtype, cap=None, mask=None)
+    gate2 = g_gamma2._gate(B, T, device=x.device, dtype=x.dtype, cap=None, mask=None)
+    # The gamma=2.0 gate should have smaller variance and range after squashing (sharpened)
+    var1 = gate1.var().item()
+    var2 = gate2.var().item()
+    range1 = (gate1.max() - gate1.min()).item()
+    range2 = (gate2.max() - gate2.min()).item()
+    print(f"  gamma shaping: var1={var1:.4f}, var2={var2:.4f}, range1={range1:.4f}, range2={range2:.4f}")
+    assert var2 <= var1, "Gamma shaping with gamma>1 should reduce variance."
+    assert range2 <= range1, "Gamma shaping with gamma>1 should reduce range."
 
     print("[gate] All good ✓")

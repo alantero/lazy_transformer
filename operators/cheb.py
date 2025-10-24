@@ -1,7 +1,9 @@
+
 # operators/cheb.py
 # Chebyshev polynomial filters over a 1D (causal) Laplacian on the time axis.
 # Adds: (1) per-group learnable coeffs in Torch, (2) laplacian="path_causal" (strict AR) and "path" (Dirichlet, non-causal).
 # NumPy/Torch compatible; no external project deps.
+# This module now supports per-call overrides via an optional `ctx` dict on the Torch module API (see `ChebFilter1D.forward/op`).
 
 from __future__ import annotations
 from typing import Any, Optional, Sequence, Tuple, Union
@@ -288,6 +290,13 @@ if _HAVE_TORCH:
             laplacian: 'path_causal' (strictly causal, recommended for AR),
                        'path' (non-causal, Dirichlet), or 'cycle' (non-causal wrap-around).
             learnable: whether coeffs are nn.Parameter.
+
+        Per-call `ctx` dict (for `forward`/`op`):
+            ctx['laplacian']: override laplacian string ('path_causal'|'path'|'cycle')
+            ctx['lmax']: float spectral radius override
+            ctx['allow_noncausal']: bool, allow non-causal laplacians
+            ctx['axis_time']: int, time axis override for this call
+            ctx['coeffs_scale']: float or Tensor broadcastable to [G, K+1] to scale the coefficients on-the-fly (does not mutate state)
         """
         def __init__(
             self,
@@ -329,18 +338,40 @@ if _HAVE_TORCH:
             else:
                 self.register_buffer("coeffs", c)
 
-        def forward(self, x: _torch.Tensor, *, axis_time: int = -2) -> _torch.Tensor:
+        def forward(self, x: _torch.Tensor, *, axis_time: int = -2, ctx: dict | None = None) -> _torch.Tensor:
+            ctx = ctx or {}
+            lap = ctx.get('laplacian', self.laplacian)
+            lmax = float(ctx.get('lmax', self.lmax))
+            allow_nc = bool(ctx.get('allow_noncausal', self.allow_noncausal))
+            ax_t = int(ctx.get('axis_time', axis_time))
+            coeffs = self.coeffs
+            # Optional on-the-fly coeff scaling
+            cscale = ctx.get('coeffs_scale', None)
+            if cscale is not None:
+                if isinstance(cscale, (int, float)):
+                    coeffs_eff = coeffs * float(cscale)
+                else:
+                    cscale_t = _torch.as_tensor(cscale, dtype=coeffs.dtype, device=coeffs.device)
+                    coeffs_eff = coeffs * cscale_t
+            else:
+                coeffs_eff = coeffs
             # If shared coeffs (shape [1,K+1]), broadcast as scalar version
-            if self.coeffs.shape[0] == 1 and self.groups == 1:
+            if coeffs_eff.shape[0] == 1 and self.groups == 1:
                 return cheb_apply(
-                    x, self.coeffs[0].tolist(),
-                    laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax,
-                    allow_noncausal=self.allow_noncausal
+                    x, coeffs_eff[0].tolist(),
+                    laplacian=lap, axis_time=ax_t, lmax=lmax,
+                    allow_noncausal=allow_nc
                 )
             return cheb_apply_torch_groupwise(
-                x, self.coeffs, groups=self.groups, laplacian=self.laplacian, axis_time=axis_time, lmax=self.lmax,
-                allow_noncausal=self.allow_noncausal
+                x, coeffs_eff, groups=self.groups, laplacian=lap, axis_time=ax_t, lmax=lmax,
+                allow_noncausal=allow_nc
             )
+
+        def op(self, x: _torch.Tensor, *, ctx: dict | None = None, axis_time: Optional[int] = None) -> _torch.Tensor:
+            """Uniform operator interface: y = Op_i(x; ctx). If axis_time is provided here, it overrides both self and ctx."""
+            if axis_time is not None:
+                return self.forward(x, axis_time=axis_time, ctx=ctx)
+            return self.forward(x, axis_time=-2, ctx=ctx)
 else:
     class ChebFilter1D:
         """
@@ -418,6 +449,13 @@ if __name__ == "__main__":
         bank = ChebFilter1D(K=K, coeffs=None, groups=4, lmax=2.0, laplacian="cycle", learnable=True, allow_noncausal=True).to(device)
         yb = bank(x)  # shape check
         assert yb.shape == x.shape
+
+        # --- Torch ctx/op per-call override checks ---
+        y_ctx = filt(x, axis_time=-2, ctx={"coeffs_scale": 0.5, "lmax": 3.0})
+        _ = y_ctx.shape
+        y_op = filt.op(x, ctx={"laplacian": "path_causal"})
+        _ = y_op.shape
+        print("  Torch ctx/op overrides ✓")
 
     elif _np is not None:
         t = _np.arange(T, dtype=float)

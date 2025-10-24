@@ -47,6 +47,13 @@ class WeylGauge(nn.Module):
         use_ema: apply a slow EMA to `cap` before the conv.
         ema_alpha: EMA coefficient (closer to 1.0 = slower).
         stopgrad_scale: if True, detach the computed scale (no grads into gauge).
+        use_groupnorm: if True, apply GroupNorm pre-normalization to h before fallback capacity.
+        gn_groups: number of groups for GroupNorm; defaults to `groups`.
+        gamma: exponent for gamma-shaped squashing of the scale after sigmoid.
+            gamma=1.0 means no shaping.
+    
+    Fallback capacity signal:
+        If neither `cap` nor `logits` are provided, capacity is computed directly from `h` as an energy proxy.
 
     Shapes:
         h:   [B, T, D]
@@ -65,6 +72,9 @@ class WeylGauge(nn.Module):
         use_ema: bool = True,
         ema_alpha: float = 0.9,
         stopgrad_scale: bool = False,
+        use_groupnorm: bool = True,
+        gn_groups: Optional[int] = None,
+        gamma: float = 1.0,
     ):
         super().__init__()
         if d <= 0:
@@ -77,6 +87,8 @@ class WeylGauge(nn.Module):
             raise ValueError("ksize must be a positive integer.")
         if not (0.0 <= ema_alpha <= 1.0):
             raise ValueError("ema_alpha must be in [0,1].")
+        if gamma <= 0.0:
+            raise ValueError("gamma must be > 0.")
 
         self.d = int(d)
         self.groups = int(groups)
@@ -110,6 +122,19 @@ class WeylGauge(nn.Module):
         else:
             nn.init.normal_(self.dw.weight, std=1e-3)
             nn.init.constant_(self.dw.bias, z0)
+
+        self.gamma = float(gamma)
+
+        self.use_groupnorm = use_groupnorm
+        if self.use_groupnorm:
+            gn_groups = gn_groups or groups
+            if d % gn_groups != 0:
+                raise ValueError(f"gn_groups must divide d. Got d={d}, gn_groups={gn_groups}.")
+            self.gn_groups = gn_groups
+            self.gn = nn.GroupNorm(num_groups=gn_groups, num_channels=d, affine=False)
+        else:
+            self.gn = None
+            self.gn_groups = None
 
     @torch.no_grad()
     def reset_to_identity(self) -> None:
@@ -178,6 +203,30 @@ class WeylGauge(nn.Module):
             return m_g.permute(0, 2, 1).contiguous()          # [B, groups, T]
         raise ValueError(f"mask last dim must be 1, groups={self.groups}, or D={self.d}. Got {C}.")
 
+    def _fallback_capacity_from_h(self, h: torch.Tensor, mask: Optional[torch.Tensor], kind: str = "group") -> torch.Tensor:
+        """
+        Compute fallback capacity from h as an energy proxy.
+        Returns a tensor shaped like accepted `cap` inputs (prefer [B,T,groups]).
+        """
+        B, T, D = h.shape
+        e = (h * h).mean(dim=-1, keepdim=True)  # [B, T, 1]
+        if mask is not None:
+            e = e * mask.to(e.dtype)
+        # Normalize per batch to approx [0,1]
+        mean_e = e.mean(dim=1, keepdim=True) * 2.0 + 1e-6
+        e = e / mean_e
+        e = e.clamp(0.0, 1.0)
+
+        if kind == "group":
+            # Aggregate/summarize to [B, T, groups] by averaging within groups
+            e4 = e.expand(B, T, self.d).view(B, T, self.groups, self.group_size)
+            cap_g = e4.mean(dim=-1)  # [B, T, groups]
+            return cap_g
+        elif kind == "channel":
+            return e.expand(B, T, self.d)
+        else:  # token
+            return e  # [B, T, 1]
+
     def compute_scale(self, cap: torch.Tensor, *, mask: Optional[torch.Tensor] = None, detach: Optional[bool] = None) -> torch.Tensor:
         """
         Turn capacity signal into per-feature scale s ∈ [smin, smax].
@@ -207,6 +256,8 @@ class WeylGauge(nn.Module):
         # Depthwise temporal smoothing over groups
         z = self.dw(cap_g)                                   # [B, groups, T]
         sigma = torch.sigmoid(z)                             # [B, groups, T]
+        if self.gamma != 1.0:
+            sigma = sigma.pow(self.gamma)
         s_g = self.smin + (self.smax - self.smin) * sigma    # [B, groups, T]
 
         if mask_g is not None:
@@ -237,6 +288,11 @@ class WeylGauge(nn.Module):
         if D != self.d:
             raise ValueError(f"Expected D={self.d}, got {D}")
 
+        if self.use_groupnorm:
+            h_norm = self.gn(h.transpose(1, 2)).transpose(1, 2)
+        else:
+            h_norm = h
+
         # Build capacity if not provided
         if cap is None:
             if logits is not None:
@@ -249,8 +305,8 @@ class WeylGauge(nn.Module):
                 else:  # token
                     cap = capacity_signal(logits, mask=mask, smooth_alpha=smooth_alpha, kind="token", detach=True)
             else:
-                # Fallback: neutral capacity (no effect after identity init)
-                cap = torch.ones(h.size(0), h.size(1), 1, device=h.device, dtype=h.dtype)
+                # Fallback: compute capacity from h energy proxy
+                cap = self._fallback_capacity_from_h(h_norm, mask, kind=cap_kind)
 
         s = self.compute_scale(cap, mask=mask, detach=detach_scale)  # [B, T, D]
         return h * s
@@ -264,7 +320,7 @@ if __name__ == "__main__":
     B, T, D, G = 2, 64, 16, 4
 
     # Identity behavior (EMA shouldn't matter with identity init)
-    gauge = WeylGauge(d=D, groups=G, ksize=5, smin=0.5, smax=2.0, init_identity=True, use_ema=True, ema_alpha=0.9)
+    gauge = WeylGauge(d=D, groups=G, ksize=5, smin=0.5, smax=2.0, init_identity=True, use_ema=True, ema_alpha=0.9, use_groupnorm=True, gamma=1.3)
     h = torch.randn(B, T, D)
     cap = torch.rand(B, T, 1)
     y = gauge(h, cap)
@@ -326,5 +382,28 @@ if __name__ == "__main__":
 
     y3m = gauge(h, logits=logits_rand, cap_kind="group", smooth_alpha=0.0, mask=mask)
     assert torch.allclose(y3m[:, -8:, :], h[:, -8:, :], atol=1e-6)
+
+    # Test gamma shaping effect on scale
+    gauge_gamma1 = WeylGauge(d=D, groups=G, ksize=3, smin=0.5, smax=2.0, init_identity=False, use_ema=False, gamma=1.0)
+    gauge_gamma2 = WeylGauge(d=D, groups=G, ksize=3, smin=0.5, smax=2.0, init_identity=False, use_ema=False, gamma=2.0)
+    # Create a dummy capacity input near sigmoid midpoint
+    cap_dummy = torch.full((B, T, G), 0.5)
+    s1 = gauge_gamma1.compute_scale(cap_dummy)
+    s2 = gauge_gamma2.compute_scale(cap_dummy)
+    # The ranges should differ due to gamma shaping
+    range1 = (s1.max() - s1.min()).item()
+    range2 = (s2.max() - s2.min()).item()
+    print(f"[gauge] gamma=1.0 scale range: {range1:.4f}, gamma=2.0 scale range: {range2:.4f}")
+    assert abs(range1 - range2) > 1e-5
+
+    # Test fallback capacity from h
+    gauge_fallback = WeylGauge(d=D, groups=G, ksize=3, smin=0.5, smax=2.0, use_ema=False, use_groupnorm=True)
+    y_fallback = gauge_fallback(h)
+    assert y_fallback.shape == h.shape
+    # Mask last 8 tokens invalid; output should be identity there
+    mask2 = torch.ones(B, T, dtype=torch.bool)
+    mask2[:, -8:] = False
+    y_fallback_masked = gauge_fallback(h, mask=mask2)
+    assert torch.allclose(y_fallback_masked[:, -8:, :], h[:, -8:, :], atol=1e-6)
 
     print("[gauge] All good ✓")

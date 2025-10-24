@@ -38,6 +38,8 @@ class OutputHead(nn.Module):
           - If `learn_bias=True` and provider has no bias, a trainable bias is created
             lazily at first forward with size V = W.shape[0].
 
+    Optional multiplicative head: logits += W_mul [ h ⊙ ( (h @ Wp) @ Wb ) ].
+
     Args:
         vocab_size: Optional[int]. Required if tie_weight=False.
         d_model: hidden size d (must match W.shape[1] when tying).
@@ -52,6 +54,11 @@ class OutputHead(nn.Module):
         pre_norm: if True, apply a LayerNorm to h just before projecting to logits.
         norm_eps: epsilon used in the LayerNorm.
         forbid_token_id: if set, the corresponding column in logits is set to -inf (useful to ban a padding token from being predicted).
+
+        use_mul: enable multiplicative interaction term.
+        mul_rank: low rank R for P ≈ Wp @ Wb (d→R→d).
+        mul_init_std: init std for Wp/Wb and mul weight.
+        mul_gate_init: initial value for a learnable gate (sigmoid) that scales the multiplicative logits.
     """
     def __init__(
         self,
@@ -69,6 +76,10 @@ class OutputHead(nn.Module):
         pre_norm: bool = True,
         norm_eps: float = 1e-5,
         forbid_token_id: Optional[int] = None,
+        use_mul: bool = False,
+        mul_rank: int = 16,
+        mul_init_std: float = 0.02,
+        mul_gate_init: float = 0.0,
     ):
         super().__init__()
         if d_model <= 0:
@@ -128,6 +139,42 @@ class OutputHead(nn.Module):
                 RuntimeError("get_tied is not used when tie_weight=False.")
             )
 
+        # Multiplicative interaction branch
+        self.use_mul = bool(use_mul)
+        if self.use_mul:
+            if mul_rank <= 0:
+                raise ValueError("mul_rank must be > 0 when use_mul=True.")
+            self.mul_rank = int(mul_rank)
+            self.mul_init_std = float(mul_init_std)
+
+            # Low-rank matrices Wp and Wb (d_model x mul_rank) and (mul_rank x d_model)
+            self.Wp = nn.Parameter(torch.empty(self.d_model, self.mul_rank))
+            self.Wb = nn.Parameter(torch.empty(self.mul_rank, self.d_model))
+            nn.init.normal_(self.Wp, std=self.mul_init_std)
+            nn.init.normal_(self.Wb, std=self.mul_init_std)
+
+            # weight_mul: V x d_model
+            if self.tie_weight:
+                if self.vocab_size is None:
+                    self._lazy_weight_mul_pending = True
+                    self.register_parameter("weight_mul", None)
+                else:
+                    self.weight_mul = nn.Parameter(torch.empty(self.vocab_size, self.d_model))
+                    nn.init.normal_(self.weight_mul, std=self.mul_init_std)
+            else:
+                self.weight_mul = nn.Parameter(torch.empty(self.vocab_size, self.d_model))
+                nn.init.normal_(self.weight_mul, std=self.mul_init_std)
+                self._lazy_weight_mul_pending = False
+
+            # Learnable gate for multiplicative logits scaling
+            self.mul_gate = nn.Parameter(torch.tensor(float(mul_gate_init)))
+        else:
+            self._lazy_weight_mul_pending = False
+            self.register_parameter("Wp", None)
+            self.register_parameter("Wb", None)
+            self.register_parameter("weight_mul", None)
+            self.register_parameter("mul_gate", None)
+
     # -------------------------------- utilities --------------------------------
 
     def _maybe_infer_vocab_and_bias(self, W: Tensor) -> None:
@@ -145,6 +192,11 @@ class OutputHead(nn.Module):
             # Create trainable bias now that V is known
             self.bias = nn.Parameter(torch.zeros(V))
             self._lazy_bias_pending = False
+
+        if self.use_mul and self._lazy_weight_mul_pending and getattr(self, "weight_mul", None) is None:
+            self.weight_mul = nn.Parameter(torch.empty(self.vocab_size, self.d_model))
+            nn.init.normal_(self.weight_mul, std=self.mul_init_std)
+            self._lazy_weight_mul_pending = False
 
     def _masked(self, logits: Tensor, mask: Optional[Tensor], mask_behavior: str) -> Tensor:
         mode = (mask_behavior or "none").lower()
@@ -211,6 +263,7 @@ class OutputHead(nn.Module):
             self._maybe_infer_vocab_and_bias(W)
 
             logits = torch.matmul(h, W.t())
+            proj_weight = W
             # Bias priority: external first, else local, else none
             if b_ext is not None:
                 logits = logits + b_ext
@@ -227,6 +280,65 @@ class OutputHead(nn.Module):
                 weight = weight.to(h.dtype)
                 bias = bias.to(h.dtype)
             logits = torch.matmul(h, weight.t()) + bias
+            proj_weight = weight
+
+        # ---------------- Multiplicative / extra head compatibility ----------------
+        # Historically, checkpoints have stored different shapes in `weight_mul`.
+        # We support:
+        #   (a) scalar ()                   → scales logits directly (no gate)
+        #   (b) [V]                         → elementwise scale per-vocab on logits
+        #   (c) [D]                         → feature mask: (h ⊙ w) · W^T
+        #   (d) [V, D]                      → current low-rank path: (h ⊙ (hWpWb)) · weight_mul^T
+        #   (e) [D, V]                      → direct projection add: h · weight_mul
+        # Any missing parameters (Wp/Wb) fall back to simpler safe behaviors.
+        if hasattr(self, "weight_mul") and getattr(self, "weight_mul") is not None:
+            wm = self.weight_mul
+            # Move/cast as needed
+            if self.cast_device and wm.device != h.device:
+                wm = wm.to(h.device)
+            if self.cast_dtype and wm.dtype != h.dtype:
+                wm = wm.to(h.dtype)
+
+            # Compute the additive term according to shape
+            add_term: Optional[Tensor] = None
+            if wm.ndim == 0:
+                # Scalar: simple scale of logits (no gate to avoid double-sigmoid effects)
+                logits = logits * wm
+            elif wm.ndim == 1:
+                if wm.numel() == logits.size(-1):
+                    # Per-vocab scaling
+                    gate = torch.sigmoid(self.mul_gate) if getattr(self, "mul_gate", None) is not None else 1.0
+                    add_term = logits * wm.view(1, 1, -1) * gate
+                elif wm.numel() == self.d_model:
+                    # Feature mask → project with same matrix used for base logits
+                    if 'proj_weight' in locals():
+                        h_masked = h * wm.view(1, 1, -1)
+                        add_term = torch.matmul(h_masked, proj_weight.t())
+                        if getattr(self, "mul_gate", None) is not None:
+                            add_term = torch.sigmoid(self.mul_gate) * add_term
+                # else: unknown length → ignore
+            elif wm.ndim == 2:
+                V = logits.size(-1)
+                D = self.d_model
+                if wm.shape == (V, D):
+                    # Preferred path with optional low-rank interaction
+                    if getattr(self, "Wp", None) is not None and getattr(self, "Wb", None) is not None:
+                        z = torch.matmul(h, self.Wp)
+                        ph = torch.matmul(z, self.Wb)
+                        inter = h * ph
+                    else:
+                        inter = h
+                    add_term = torch.matmul(inter, wm.t())
+                    if getattr(self, "mul_gate", None) is not None:
+                        add_term = torch.sigmoid(self.mul_gate) * add_term
+                elif wm.shape == (D, V):
+                    add_term = torch.matmul(h, wm)
+                    if getattr(self, "mul_gate", None) is not None:
+                        add_term = torch.sigmoid(self.mul_gate) * add_term
+                # else: unknown shape → ignore
+
+            if add_term is not None:
+                logits = logits + add_term
 
         if self.forbid_token_id is not None:
             fid = int(self.forbid_token_id)
@@ -305,5 +417,25 @@ if __name__ == "__main__":
     logits_forbid = head_forbid(h)
     assert torch.all(torch.isinf(logits_forbid[..., forbid_id]) & (logits_forbid[..., forbid_id] < 0))
     print("[output_head] forbid_token_id masking ok")
+
+    # 7) Learned head + use_mul=True test
+    head_mul = OutputHead(vocab_size=V, d_model=D, tie_weight=False, use_mul=True, mul_rank=8, mul_gate_init=0.0)
+    logits_mul_0 = head_mul(h)
+    assert logits_mul_0.shape == (B, T, V)
+    # Change mul_gate to large value to saturate sigmoid ~1
+    head_mul.mul_gate.data.fill_(5.0)
+    logits_mul_1 = head_mul(h)
+    assert logits_mul_1.shape == (B, T, V)
+    diff_mul = (logits_mul_1 - logits_mul_0).abs().max().item()
+    print(f"[output_head] learned + use_mul logits diff with gate change: {diff_mul:.2e}")
+    assert diff_mul > 1e-4
+
+    # 8) Tied head + use_mul=True with lazy vocab_size test
+    head_tied_mul = OutputHead(vocab_size=None, d_model=D, tie_weight=True, get_tied=lambda: W, learn_bias=True, use_mul=True, mul_rank=8)
+    logits_tied_mul = head_tied_mul(h)
+    assert logits_tied_mul.shape == (B, T, V)
+    assert head_tied_mul.vocab_size == V
+    assert isinstance(head_tied_mul.weight_mul, nn.Parameter)
+    print("[output_head] tied + use_mul lazy vocab_size ok")
 
     print("[output_head] All good ✓")
